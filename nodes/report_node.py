@@ -4,10 +4,10 @@ def report_node(state):
         status = "SUCCESS"
 
     state["report"] = f"""
-STOCK: {state['symbol']}
+SYMBOL: {state['symbol']}
 STATUS: {status}
-RECOMMENDATION: {state.get('recommendation') or 'NEUTRAL'}
-RECOMMENDATION_REASON: {state.get('recommendation_reason') or 'See analysis for supporting reasoning.'}
+SIGNAL: {state.get('signal') or state.get('recommendation') or 'NEUTRAL'}
+CONFIDENCE: {state.get('confidence') or 'Low'}
 
 {state['analysis']}
 """.strip()

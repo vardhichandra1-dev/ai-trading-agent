@@ -1,11 +1,11 @@
 # AI-Driven NSE Stock Research Agent
 
-This project analyzes NSE corporate announcements, enriches them with PDF disclosures, web search context, market data, and local LLM reasoning, then writes analyst-style reports for each stock.
+This project analyzes NSE corporate announcements, extracts disclosure PDFs, generates Groq-backed trading signals with local Ollama fallback, conditionally validates actionable signals with Tavily, and sends Telegram alerts.
 
 ## Pipeline
 
 ```text
-NSE Announcement -> Mistral Query -> PDF -> Tavily Search -> Kite Market -> Llama Reason -> Report
+NSE Data -> PDF Extraction -> Groq Signal Generation -> Conditional Tavily -> Groq Validation -> Report -> Telegram Notification
 ```
 
 ## Project Structure
@@ -15,7 +15,7 @@ NSE Announcement -> Mistral Query -> PDF -> Tavily Search -> Kite Market -> Llam
 - `graph.py` builds the LangGraph workflow.
 - `state.py` defines the shared graph state.
 - `nodes/` contains each pipeline step.
-- `services/` wraps local Ollama calls plus external APIs for PDF extraction, Tavily, and Kite.
+- `services/` wraps local Ollama calls plus external APIs for PDF extraction, Tavily, and Telegram.
 - `utils/` contains logging and retry helpers.
 
 ## Environment
@@ -23,25 +23,33 @@ NSE Announcement -> Mistral Query -> PDF -> Tavily Search -> Kite Market -> Llam
 Create a local `.env` file:
 
 ```env
+GROQ_API_KEY=
+GROQ_MODEL=openai/gpt-oss-120b
+GROQ_TIMEOUT_SECONDS=90
+GROQ_QUERY_TIMEOUT_SECONDS=90
+GROQ_VALIDATION_TIMEOUT_SECONDS=120
 OLLAMA_URL=http://localhost:11434/api/generate
-OLLAMA_QUERY_MODEL=mistral:7b-instruct
-OLLAMA_REASONING_MODEL=llama3:8b-instruct
-OLLAMA_QUERY_TIMEOUT_SECONDS=90
-OLLAMA_REASONING_TIMEOUT_SECONDS=240
+LOCAL_LLM_MODELS=phi3,mistral:7b,llama3:8b
+OLLAMA_TIMEOUT_SECONDS=180
+OLLAMA_NUM_CTX=1024
+OLLAMA_NUM_PREDICT=512
+OLLAMA_QUERY_TIMEOUT_SECONDS=120
+OLLAMA_VALIDATION_TIMEOUT_SECONDS=240
 TAVILY_API_KEY=
-KITE_API_KEY=
-KITE_ACCESS_TOKEN=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
 
 Run Ollama locally before starting the agent:
 
 ```bash
-ollama pull mistral:7b-instruct
-ollama pull llama3:8b-instruct
+ollama pull phi3
+ollama pull mistral:7b
+ollama pull llama3:8b
 ollama serve
 ```
 
-The pipeline is intentionally sequential. Each stock completes the full chain before the next stock starts, and only one local model is invoked at a time: Mistral first for fast query generation, then Llama 3 8B for deeper reasoning.
+The pipeline is intentionally sequential. Each stock completes the full chain before the next stock starts. Groq model `openai/gpt-oss-120b` is used first. If Groq fails, Ollama models are tried one at a time in this order: `phi3`, `mistral:7b`, then `llama3:8b`. Tavily is called only when the initial signal is `BUY` or `SELL`; `NEUTRAL` signals skip external search completely.
 
 ## Run
 
@@ -49,7 +57,7 @@ The pipeline is intentionally sequential. Each stock completes the full chain be
 python main.py
 ```
 
-By default, the system runs continuously. It processes one pending stock at a time from local `data/nse_master.json`, skips announcements already present in `data/ai_research_output.json`, prints the recommendation in the terminal, saves it, and immediately moves to the next pending stock.
+By default, the system runs continuously. It processes one pending stock at a time from local `data/nse_master.json`, skips announcements already present in `data/ai_research_output.json`, prints the signal in the terminal, sends a Telegram message, saves the result, and immediately moves to the next pending stock.
 
 The NSE website is not hit between local stock analyses. When there are no pending local announcements, the app waits a random 5-10 minutes, such as `7:31` or `8:09`, then checks NSE once for fresh announcements.
 

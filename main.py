@@ -63,12 +63,15 @@ def initial_state(record):
         "pdf_text": "",
         "queries": [],
         "search_results": "",
-        "market_data": {},
-        "market_skipped": False,
         "analysis": "",
         "report": "",
+        "signal": "",
+        "confidence": "",
         "recommendation": "",
         "recommendation_reason": "",
+        "telegram_message": "",
+        "telegram_sent": False,
+        "telegram_error": "",
         "status": "PENDING",
         "error_stage": "",
         "error_reason": "",
@@ -84,18 +87,21 @@ def failed_state(record, error):
         "pdf_text": "",
         "queries": [],
         "search_results": "",
-        "market_data": {},
-        "market_skipped": True,
         "analysis": "",
         "report": (
-            f"STOCK: {symbol}\n"
+            f"SYMBOL: {symbol}\n"
             "STATUS: FAILED\n"
-            "RECOMMENDATION: NEUTRAL\n"
-            f"RECOMMENDATION_REASON: {recommendation_reason}\n\n"
+            "SIGNAL: NEUTRAL\n"
+            "CONFIDENCE: Low\n\n"
             f"Pipeline failed: {error}"
         ),
+        "signal": "NEUTRAL",
+        "confidence": "Low",
         "recommendation": "NEUTRAL",
         "recommendation_reason": recommendation_reason,
+        "telegram_message": "",
+        "telegram_sent": False,
+        "telegram_error": "",
         "status": "FAILED",
         "error_stage": "PIPELINE",
         "error_reason": str(error),
@@ -111,14 +117,16 @@ def pick_next_unprocessed_record(records, results):
 def print_recommendation(result):
     symbol = result.get("symbol") or "UNKNOWN"
     status = result.get("status") or "UNKNOWN"
-    recommendation = result.get("recommendation") or "NEUTRAL"
-    reason = result.get("recommendation_reason") or "No recommendation reason generated."
+    signal = result.get("signal") or result.get("recommendation") or "NEUTRAL"
+    confidence = result.get("confidence") or "Low"
+    reason = result.get("recommendation_reason") or result.get("analysis") or "No signal reason generated."
 
     print("")
     print("=" * 72)
     print(f"STOCK: {symbol}")
     print(f"STATUS: {status}")
-    print(f"RECOMMENDATION: {recommendation}")
+    print(f"SIGNAL: {signal}")
+    print(f"CONFIDENCE: {confidence}")
     print(f"REASON: {reason}")
     print("=" * 72)
     print("")

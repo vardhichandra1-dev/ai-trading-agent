@@ -4,48 +4,58 @@ import requests
 
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_REASONING_MODEL = "llama3:8b-instruct"
-DEFAULT_QUERY_MODEL = "mistral:7b-instruct"
+DEFAULT_OLLAMA_MODELS = ("phi3", "mistral:7b", "llama3:8b")
+MIN_TIMEOUT_SECONDS = 120
+DEFAULT_NUM_CTX = 1024
+DEFAULT_NUM_PREDICT = 512
 
 
-def call_ollama(prompt, model=None, timeout=None, options=None):
+def configured_models():
+    configured = os.getenv("LOCAL_LLM_MODELS") or os.getenv("OLLAMA_MODEL")
+    if not configured:
+        return list(DEFAULT_OLLAMA_MODELS)
+
+    models = [model.strip() for model in configured.split(",") if model.strip()]
+    return models or list(DEFAULT_OLLAMA_MODELS)
+
+
+def call_local_llm(prompt, timeout=None, options=None):
     url = os.getenv("OLLAMA_URL", DEFAULT_OLLAMA_URL)
-    model_name = model or os.getenv("OLLAMA_REASONING_MODEL", DEFAULT_REASONING_MODEL)
-    request_timeout = timeout or int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
-
-    payload = {
-        "model": model_name,
-        "prompt": prompt,
-        "stream": False,
+    configured_timeout = timeout or int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
+    request_timeout = max(MIN_TIMEOUT_SECONDS, configured_timeout)
+    default_options = {
+        "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", str(DEFAULT_NUM_CTX))),
+        "num_predict": int(os.getenv("OLLAMA_NUM_PREDICT", str(DEFAULT_NUM_PREDICT))),
     }
-
     if options:
-        payload["options"] = options
+        default_options.update(options)
+    errors = []
 
-    res = requests.post(url, json=payload, timeout=request_timeout)
-    res.raise_for_status()
+    for model_name in configured_models():
+        payload = {
+            "model": model_name,
+            "prompt": prompt,
+            "stream": False,
+        }
 
-    data = res.json()
-    response = data.get("response", "").strip()
-    if not response:
-        raise ValueError(f"Ollama returned an empty response for model {model_name}")
+        payload["options"] = default_options
 
-    return response
+        try:
+            res = requests.post(url, json=payload, timeout=request_timeout)
+            if not res.ok:
+                raise RuntimeError(f"HTTP {res.status_code}: {res.text[:500]}")
+
+            data = res.json()
+            response = data.get("response", "").strip()
+            if not response:
+                raise ValueError("Ollama returned an empty response")
+
+            return response
+        except Exception as e:
+            errors.append(f"{model_name}: {e}")
+
+    raise RuntimeError("All configured Ollama models failed. " + " | ".join(errors))
 
 
-def call_query_model(prompt):
-    return call_ollama(
-        prompt,
-        model=os.getenv("OLLAMA_QUERY_MODEL", DEFAULT_QUERY_MODEL),
-        timeout=int(os.getenv("OLLAMA_QUERY_TIMEOUT_SECONDS", "90")),
-        options={"temperature": 0.2},
-    )
-
-
-def call_reasoning_model(prompt):
-    return call_ollama(
-        prompt,
-        model=os.getenv("OLLAMA_REASONING_MODEL", DEFAULT_REASONING_MODEL),
-        timeout=int(os.getenv("OLLAMA_REASONING_TIMEOUT_SECONDS", "240")),
-        options={"temperature": 0.1},
-    )
+def call_phi3(prompt, timeout=None, options=None):
+    return call_local_llm(prompt, timeout=timeout, options=options)

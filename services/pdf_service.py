@@ -30,4 +30,4 @@ def extract_pdf_text(url):
     finally:
         doc.close()
 
-    return text[:3000]
+    return text

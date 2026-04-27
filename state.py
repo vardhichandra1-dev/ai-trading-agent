@@ -11,13 +11,15 @@ class GraphState(TypedDict):
     queries: List[str]
     search_results: str
 
-    market_data: Dict
-    market_skipped: bool
-
     analysis: str
     report: str
+    signal: str
+    confidence: str
     recommendation: str
     recommendation_reason: str
+    telegram_message: str
+    telegram_sent: bool
+    telegram_error: str
 
     status: str
     error_stage: str

@@ -3,5 +3,4 @@ langgraph
 requests
 python-dotenv
 pymupdf
-kiteconnect
 pandas
