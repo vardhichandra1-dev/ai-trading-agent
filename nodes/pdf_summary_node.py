@@ -1,16 +1,18 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
-from services.ollama_service import call_phi3
+from services.llm_service import call_llm
 from utils.logger import log
 
 
 CACHE_FILE = Path("data/pdf_summaries.json")
-DEFAULT_CHUNK_CHARS = 3000
+DEFAULT_CHUNK_CHARS = 12000
 DEFAULT_MAX_SUMMARY_CHARS = 5000
 DEFAULT_SUMMARY_BATCH_SIZE = 6
+DEFAULT_SUMMARY_THRESHOLD_CHARS = 18000
 
 
 def load_cache():
@@ -38,6 +40,15 @@ def chunk_text(text, chunk_chars):
     return [text[i : i + chunk_chars] for i in range(0, len(text), chunk_chars)]
 
 
+def find_page_range(chunk):
+    page_nums = [int(m) for m in re.findall(r"\[PAGE (\d+)\]", chunk)]
+    if not page_nums:
+        return ""
+    if min(page_nums) == max(page_nums):
+        return f" (page {min(page_nums)})"
+    return f" (pages {min(page_nums)}-{max(page_nums)})"
+
+
 def compact(text, max_chars):
     clean = " ".join(str(text or "").split())
     if len(clean) <= max_chars:
@@ -46,8 +57,9 @@ def compact(text, max_chars):
 
 
 def build_chunk_prompt(record, chunk, chunk_number, total_chunks):
+    page_range = find_page_range(chunk)
     return f"""
-You are summarizing an NSE disclosure PDF for a stock trading signal system.
+You are summarizing a large NSE disclosure PDF for a stock trading signal system.
 
 Read this PDF chunk carefully and extract only market-relevant facts.
 
@@ -58,7 +70,7 @@ SUBJECT: {record.get("SUBJECT", "")}
 DETAILS: {record.get("DETAILS", "")}
 BROADCAST DATE/TIME: {record.get("BROADCAST DATE/TIME", "")}
 
-PDF CHUNK {chunk_number} OF {total_chunks}:
+PDF CHUNK {chunk_number} OF {total_chunks}{page_range}:
 {chunk}
 
 Return a concise summary with:
@@ -66,6 +78,7 @@ Return a concise summary with:
 - financial/order/contract/legal/management details
 - dates, values, quantities, parties, approvals, risks
 - whether this chunk supports BUY, SELL, or NEUTRAL and why
+- any page-local caveats such as missing tables, annexures, or scanned text
 """.strip()
 
 
@@ -107,12 +120,11 @@ def reduce_summaries(record, summaries, timeout, num_ctx):
         for index in range(0, len(current), batch_size):
             batch = "\n\n".join(current[index : index + batch_size])
             reduced.append(
-                call_phi3(
+                call_llm(
                     build_final_summary_prompt(record, batch),
                     timeout=timeout,
                     options={
                         "temperature": 0.1,
-                        "num_ctx": num_ctx,
                         "num_predict": num_predict,
                     },
                 )
@@ -128,36 +140,33 @@ def summarize_pdf(record, pdf_text):
     chunk_chars = int(os.getenv("PDF_SUMMARY_CHUNK_CHARS", str(DEFAULT_CHUNK_CHARS)))
     max_summary_chars = int(os.getenv("PDF_SUMMARY_MAX_CHARS", str(DEFAULT_MAX_SUMMARY_CHARS)))
     timeout = int(os.getenv("PDF_SUMMARY_TIMEOUT_SECONDS", "180"))
-    num_ctx = int(os.getenv("PDF_SUMMARY_NUM_CTX", "1024"))
     num_predict = int(os.getenv("PDF_SUMMARY_NUM_PREDICT", "384"))
 
     chunks = chunk_text(pdf_text, chunk_chars)
     chunk_summaries = []
 
     for index, chunk in enumerate(chunks, start=1):
-        summary = call_phi3(
+        summary = call_llm(
             build_chunk_prompt(record, chunk, index, len(chunks)),
             timeout=timeout,
             options={
                 "temperature": 0.1,
-                "num_ctx": num_ctx,
                 "num_predict": num_predict,
             },
         )
         chunk_summaries.append(summary)
         log("PDF_SUMMARY", f"Chunk {index}/{len(chunks)} summarized")
 
-    reduced_summaries = reduce_summaries(record, chunk_summaries, timeout, num_ctx)
+    reduced_summaries = reduce_summaries(record, chunk_summaries, timeout, None)
     combined = "\n\n".join(reduced_summaries)
     if len(combined) <= max_summary_chars:
         return compact(combined, max_summary_chars)
 
-    final_summary = call_phi3(
+    final_summary = call_llm(
         build_final_summary_prompt(record, combined),
         timeout=timeout,
         options={
             "temperature": 0.1,
-            "num_ctx": num_ctx,
             "num_predict": int(os.getenv("PDF_SUMMARY_FINAL_NUM_PREDICT", "700")),
         },
     )
@@ -168,6 +177,12 @@ def pdf_summary_node(state):
     pdf_text = state.get("pdf_text", "")
     if not pdf_text:
         state["pdf_summary"] = ""
+        return state
+
+    threshold_chars = int(os.getenv("PDF_SUMMARY_THRESHOLD_CHARS", str(DEFAULT_SUMMARY_THRESHOLD_CHARS)))
+    if len(pdf_text) <= threshold_chars:
+        state["pdf_summary"] = ""
+        log("PDF_SUMMARY", f"Skipped for short PDF {len(pdf_text)} chars")
         return state
 
     record = state["records"][0]

@@ -32,7 +32,7 @@ def parse_json_object(text):
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if match:
             return json.loads(match.group(0))
-    raise ValueError("Phi-3 response did not contain valid JSON")
+    raise ValueError("Groq response did not contain valid JSON")
 
 
 def extract_signal_payload(response):
@@ -49,7 +49,7 @@ def extract_signal_payload(response):
         return {
             "signal": signal,
             "confidence": "Low",
-            "reasoning": response.strip() or "No reasoning returned by Phi-3.",
+            "reasoning": response.strip() or "No reasoning returned by Groq.",
             "already_reflected": False,
             "notify": signal in {"BUY", "SELL"},
         }
@@ -57,7 +57,7 @@ def extract_signal_payload(response):
     return {
         "signal": normalize_signal(data.get("signal")),
         "confidence": normalize_confidence(data.get("confidence")),
-        "reasoning": str(data.get("reasoning") or "").strip() or "No reasoning returned by Phi-3.",
+        "reasoning": str(data.get("reasoning") or "").strip() or "No reasoning returned by Groq.",
         "already_reflected": str(data.get("already_reflected", "false")).strip().lower() in TRUTHY_VALUES,
         "notify": str(data.get("notify", "true")).strip().lower() in TRUTHY_VALUES,
     }
@@ -172,7 +172,7 @@ def signal_node(state):
         pdf_text = state.get("pdf_text", "")
         pdf_summary = state.get("pdf_summary", "")
         if pdf_summary:
-            log("SIGNAL", f"Using Phi-3 PDF summary {len(pdf_summary)}/{len(pdf_text)} chars")
+            log("SIGNAL", f"Using Groq PDF summary {len(pdf_summary)}/{len(pdf_text)} chars")
         else:
             pdf_context = build_pdf_context(state["records"][0], pdf_text)
             if len(pdf_text) > len(pdf_context):
@@ -196,7 +196,7 @@ def signal_node(state):
         state["confidence"] = "Low"
         state["analysis"] = f"LLM signal generation failed: {e}"
         state["recommendation"] = "NEUTRAL"
-        state["recommendation_reason"] = "Groq primary and local fallback models failed, so no actionable trade signal was generated."
+        state["recommendation_reason"] = "Groq signal generation failed, so no actionable trade signal was generated."
         state["status"] = "FAILED"
         state["error_stage"] = "SIGNAL"
         state["error_reason"] = str(e)

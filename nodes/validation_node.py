@@ -4,7 +4,7 @@ import re
 
 from nodes.signal_node import extract_signal_payload
 from services.llm_service import call_llm
-from services.tavily_service import search_tavily
+from services.tavily_service import save_search_log, search_tavily
 from utils.logger import log
 from utils.retry import retry
 
@@ -58,15 +58,21 @@ def fallback_queries(record):
 
 def build_query_prompt(state):
     record = state["records"][0]
+    signal = state.get("signal", "")
     return f"""
-Generate 3 to 5 concise web search queries to validate this actionable stock signal.
-The goal is to check whether this NSE event is fresh or whether the same update was already public earlier and likely reflected in the stock price.
+Generate 3 to 5 concise web search queries to validate this {signal} trading signal for an Indian stock.
+The goal is to confirm whether this NSE event is fresh news not yet priced in, or was already public and reflected in the stock price.
+
+For a {signal} signal, target queries that find:
+- Recent news confirming or contradicting the {signal} rationale
+- Whether the stock price has already reacted to this announcement
+- Analyst views or institutional activity around this specific event
 
 SYMBOL: {record.get("SYMBOL", "")}
 COMPANY NAME: {record.get("COMPANY NAME", "")}
 SUBJECT: {record.get("SUBJECT", "")}
 DETAILS: {record.get("DETAILS", "")}
-INITIAL SIGNAL: {state.get("signal", "")}
+INITIAL SIGNAL: {signal}
 INITIAL REASONING: {compact_text(state.get("analysis", ""), 900)}
 
 Return only valid JSON:
@@ -96,7 +102,7 @@ DETAILS: {record.get("DETAILS", "")}
 BROADCAST DATE/TIME: {record.get("BROADCAST DATE/TIME", "")}
 ATTACHMENT: {record.get("ATTACHMENT", "")}
 
-Phi-3 PDF summary or short PDF excerpt for reference:
+Groq PDF summary or short PDF excerpt for reference:
 {pdf_excerpt}
 
 EXTERNAL SEARCH CONTEXT:
@@ -134,7 +140,7 @@ def validation_node(state):
     try:
         query_response = call_llm(
             build_query_prompt(state),
-            timeout=int(os.getenv("GROQ_QUERY_TIMEOUT_SECONDS", os.getenv("OLLAMA_QUERY_TIMEOUT_SECONDS", "120"))),
+            timeout=int(os.getenv("GROQ_QUERY_TIMEOUT_SECONDS", "120")),
             options={"temperature": 0.2, "num_predict": 160},
         )
         queries = parse_queries(query_response)
@@ -158,12 +164,26 @@ def validation_node(state):
     log("QUERY", f"{len(state['queries'])} validation queries generated")
 
     results = []
+    results_by_query = {}
     for query in state["queries"]:
         try:
-            results.extend(retry(lambda q=query: search_tavily(q)))
+            qresults = retry(lambda q=query: search_tavily(q))
+            results_by_query[query] = qresults
+            results.extend(qresults)
         except Exception as e:
+            results_by_query[query] = []
             state["error_stage"] = state.get("error_stage") or "SEARCH"
             state["error_reason"] = state.get("error_reason") or str(e)
+
+    try:
+        save_search_log(
+            symbol=record.get("SYMBOL", ""),
+            signal=state.get("signal", ""),
+            queries=state["queries"],
+            results_by_query=results_by_query,
+        )
+    except Exception:
+        pass
 
     state["search_results"] = compact_text(" ".join(results), MAX_SEARCH_CONTEXT_CHARS)
     log("TAVILY", f"{len(results)} results")
@@ -182,7 +202,7 @@ def validation_node(state):
     try:
         response = call_llm(
             build_validation_prompt(state),
-            timeout=int(os.getenv("GROQ_VALIDATION_TIMEOUT_SECONDS", os.getenv("OLLAMA_VALIDATION_TIMEOUT_SECONDS", "240"))),
+            timeout=int(os.getenv("GROQ_VALIDATION_TIMEOUT_SECONDS", "240")),
             options={"temperature": 0.1, "num_predict": 384},
         )
         payload = extract_signal_payload(response)
