@@ -24,6 +24,19 @@ def build_telegram_message(state):
 
 
 def telegram_node(state):
+    signal = state.get("signal") or state.get("recommendation") or "NEUTRAL"
+    if signal not in {"BUY", "SELL"}:
+        state["telegram_message"] = ""
+        state["telegram_sent"] = False
+        log("TELEGRAM", "Skipped for NEUTRAL signal")
+        return state
+
+    if not state.get("notify", False):
+        state["telegram_message"] = ""
+        state["telegram_sent"] = False
+        log("TELEGRAM", "Skipped because signal is not fresh/actionable")
+        return state
+
     message = build_telegram_message(state)
     state["telegram_message"] = message
 

@@ -8,6 +8,7 @@ class GraphState(TypedDict):
     records: List[Dict]
 
     pdf_text: str
+    pdf_summary: str
     queries: List[str]
     search_results: str
 
@@ -15,6 +16,8 @@ class GraphState(TypedDict):
     report: str
     signal: str
     confidence: str
+    already_reflected: bool
+    notify: bool
     recommendation: str
     recommendation_reason: str
     telegram_message: str

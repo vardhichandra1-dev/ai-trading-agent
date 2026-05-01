@@ -28,6 +28,15 @@ GROQ_MODEL=openai/gpt-oss-120b
 GROQ_TIMEOUT_SECONDS=90
 GROQ_QUERY_TIMEOUT_SECONDS=90
 GROQ_VALIDATION_TIMEOUT_SECONDS=120
+SIGNAL_PDF_MAX_CHARS=18000
+PDF_SUMMARY_MODEL=phi3
+PDF_SUMMARY_CHUNK_CHARS=3000
+PDF_SUMMARY_MAX_CHARS=5000
+PDF_SUMMARY_TIMEOUT_SECONDS=180
+PDF_SUMMARY_NUM_CTX=1024
+PDF_SUMMARY_NUM_PREDICT=384
+PDF_SUMMARY_FINAL_NUM_PREDICT=700
+PDF_SUMMARY_BATCH_SIZE=6
 OLLAMA_URL=http://localhost:11434/api/generate
 LOCAL_LLM_MODELS=phi3,mistral:7b,llama3:8b
 OLLAMA_TIMEOUT_SECONDS=180
@@ -49,7 +58,7 @@ ollama pull llama3:8b
 ollama serve
 ```
 
-The pipeline is intentionally sequential. Each stock completes the full chain before the next stock starts. Groq model `openai/gpt-oss-120b` is used first. If Groq fails, Ollama models are tried one at a time in this order: `phi3`, `mistral:7b`, then `llama3:8b`. Tavily is called only when the initial signal is `BUY` or `SELL`; `NEUTRAL` signals skip external search completely.
+The pipeline is intentionally sequential. Each stock completes the full chain before the next stock starts. Groq model `openai/gpt-oss-120b` is used first. If Groq fails, Ollama models are tried one at a time in this order: `phi3`, `mistral:7b`, then `llama3:8b`. Tavily is called only when the initial signal is `BUY` or `SELL`; `NEUTRAL` signals skip external search and Telegram completely. BUY/SELL Telegram alerts are sent only when Tavily validation confirms the event appears fresh and not already reflected in the market.
 
 ## Run
 

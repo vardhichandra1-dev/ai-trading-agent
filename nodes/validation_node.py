@@ -49,6 +49,8 @@ def fallback_queries(record):
     subject = record.get("SUBJECT") or "NSE announcement"
     return [
         f"{company} {subject} latest news",
+        f"{company} {subject} announced earlier",
+        f"{company} {subject} already priced in stock",
         f"{company} {subject} stock impact",
         f"{company} NSE announcement analysis",
     ]
@@ -58,6 +60,7 @@ def build_query_prompt(state):
     record = state["records"][0]
     return f"""
 Generate 3 to 5 concise web search queries to validate this actionable stock signal.
+The goal is to check whether this NSE event is fresh or whether the same update was already public earlier and likely reflected in the stock price.
 
 SYMBOL: {record.get("SYMBOL", "")}
 COMPANY NAME: {record.get("COMPANY NAME", "")}
@@ -74,7 +77,7 @@ Return only valid JSON:
 def build_validation_prompt(state):
     record = state["records"][0]
     initial_reasoning = compact_text(state.get("analysis", ""), MAX_INITIAL_REASONING_CHARS)
-    pdf_excerpt = compact_text(state.get("pdf_text", ""), MAX_PDF_VALIDATION_CHARS)
+    pdf_excerpt = compact_text(state.get("pdf_summary") or state.get("pdf_text", ""), MAX_PDF_VALIDATION_CHARS)
     search_context = compact_text(state.get("search_results", ""), MAX_SEARCH_CONTEXT_CHARS)
 
     return f"""
@@ -93,7 +96,7 @@ DETAILS: {record.get("DETAILS", "")}
 BROADCAST DATE/TIME: {record.get("BROADCAST DATE/TIME", "")}
 ATTACHMENT: {record.get("ATTACHMENT", "")}
 
-Short PDF excerpt for reference:
+Phi-3 PDF summary or short PDF excerpt for reference:
 {pdf_excerpt}
 
 EXTERNAL SEARCH CONTEXT:
@@ -102,11 +105,18 @@ EXTERNAL SEARCH CONTEXT:
 Confirm or refine the signal into exactly one of BUY, SELL, or NEUTRAL.
 Use search only as validation. NSE data and PDF content remain the primary evidence.
 
+Freshness rule:
+- If the same material update was already reported publicly before this NSE announcement, or search context shows the market already reacted to it, set already_reflected=true, notify=false, and usually downgrade to NEUTRAL.
+- If the event appears fresh and still actionable, set already_reflected=false and notify=true for BUY/SELL.
+- NEUTRAL must always have notify=false.
+
 Return only valid JSON:
 {{
   "signal": "BUY or SELL or NEUTRAL",
   "confidence": "High or Medium or Low",
-  "reasoning": "Detailed reasoning including NSE event, PDF insights, and external confirmation."
+  "already_reflected": true or false,
+  "notify": true or false,
+  "reasoning": "Detailed reasoning including NSE event, PDF insights, external confirmation, and whether the update already appeared in the market earlier."
 }}
 """.strip()
 
@@ -115,6 +125,8 @@ def validation_node(state):
     if state.get("signal") not in {"BUY", "SELL"}:
         log("TAVILY", "Skipped for NEUTRAL signal")
         state["search_results"] = ""
+        state["already_reflected"] = False
+        state["notify"] = False
         return state
 
     record = state["records"][0]
@@ -156,6 +168,17 @@ def validation_node(state):
     state["search_results"] = compact_text(" ".join(results), MAX_SEARCH_CONTEXT_CHARS)
     log("TAVILY", f"{len(results)} results")
 
+    if not results:
+        state["notify"] = False
+        state["already_reflected"] = False
+        state["analysis"] = (
+            f"{state.get('analysis', '')}\n\n"
+            "Tavily validation returned no usable results, so no Telegram alert was sent."
+        ).strip()
+        state["recommendation_reason"] = state["analysis"]
+        log("VALIDATION", "Skipped notification because Tavily returned no results")
+        return state
+
     try:
         response = call_llm(
             build_validation_prompt(state),
@@ -166,10 +189,19 @@ def validation_node(state):
 
         state["signal"] = payload["signal"]
         state["confidence"] = payload["confidence"]
+        state["already_reflected"] = payload.get("already_reflected", False)
+        state["notify"] = (
+            payload.get("notify", state["signal"] in {"BUY", "SELL"})
+            and state["signal"] in {"BUY", "SELL"}
+            and not state["already_reflected"]
+        )
         state["analysis"] = payload["reasoning"]
         state["recommendation"] = payload["signal"]
         state["recommendation_reason"] = payload["reasoning"]
-        log("VALIDATION", f"{state['signal']} / {state['confidence']}")
+        log(
+            "VALIDATION",
+            f"{state['signal']} / {state['confidence']} / notify={state['notify']} / already_reflected={state['already_reflected']}",
+        )
     except Exception as e:
         state["error_stage"] = state.get("error_stage") or "VALIDATION"
         state["error_reason"] = state.get("error_reason") or str(e)
@@ -178,5 +210,7 @@ def validation_node(state):
             "External validation could not complete, so the initial LLM signal was retained."
         ).strip()
         state["recommendation_reason"] = state["analysis"]
+        state["already_reflected"] = False
+        state["notify"] = False
 
     return state
