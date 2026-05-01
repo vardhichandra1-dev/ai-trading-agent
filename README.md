@@ -6,35 +6,55 @@ This project analyzes NSE corporate announcements, extracts disclosure PDFs, gen
 
 ```mermaid
 flowchart TD
-    A(["▶ Starter Guide"])
-    B(["▶ Make Flowchart"])
-    C(["📖 Learn More"])
-    GEM{{"◆"}}
-    D{"Use the editor"}
-    E(["Many shapes"])
+    A([Start]) --> B[Fetch NSE announcements\nnse_fetcher]
+    B --> C[(nse_master.json)]
+    C --> D{Pending records?}
+    D -- No --> E[Sleep 5–10 min] --> B
+    D -- Yes --> F
 
-    F["Build and Design"]
-    G["Use AI"]
-    H["Mermaid js"]
+    subgraph pipeline [LangGraph Pipeline — one stock at a time]
+        F[Download PDF attachment\npdf_node]
+        F --> G[Page-by-page extraction\npdf_service\nPDF_MAX_PAGES limit, Skip scanned]
+        G --> H{PDF size}
 
-    I(["👤 Visual Editor"]):::purple
-    J(["💬 AI chat"]):::green
-    K(["</> Text"]):::blue
+        H -- "≤ PDF_SUMMARY_THRESHOLD_CHARS" --> I[pdf_summary_node\nPass through — no summarisation]
+        H -- "> PDF_SUMMARY_THRESHOLD_CHARS" --> J[Chunk PDF\nPDF_SUMMARY_CHUNK_CHARS each\nwith page range labels]
+        J --> K[call_llm per chunk\nGroq primary → backup1 → backup2]
+        K --> L[Batch-reduce chunk summaries\ncapped at PDF_SUMMARY_MAX_CHARS]
+        L --> N[(pdf_summaries.json cache)]
+        N --> O
 
-    L(["← Add node in toolbar"])
-    M(["← Open AI in side menu"])
-    N(["← Type Mermaid syntax"])
+        I --> O[signal_node\nBuild PDF context or use summary]
+        O --> P[call_llm\nGroq primary → backup1 → backup2]
+        P --> Q{Initial signal}
 
-    A --> B --> C
-    C --> GEM & D & E
-    D --> F & G & H
-    F --> I --> L
-    G --> J --> M
-    H --> K --> N
+        Q -- NEUTRAL --> V[Format final report\nreport_node]
+        Q -- "BUY / SELL" --> R[Generate search queries via call_llm\nvalidation_node]
+        R --> S[Tavily search\n3–5 queries]
+        S --> T{Search results?}
+        T -- None --> U[Skip validation\nnotify = false] --> AA
+        T -- Found --> W[Validation call_llm\nGroq primary → backup1 → backup2]
+        W --> X{Fresh & confirmed?}
+        X -- "Already reflected / downgraded" --> Y[NEUTRAL or notify = false] --> AA
+        X -- "Fresh BUY / SELL" --> Z[notify = true] --> AA
 
-    classDef purple fill:#7C3AED,color:#fff,stroke:none
-    classDef green fill:#16A34A,color:#fff,stroke:none
-    classDef blue fill:#2563EB,color:#fff,stroke:none
+        V --> AA[telegram_node]
+        AA -- "notify = true" --> AB[Send Telegram alert\nBUY / SELL with reasoning]
+        AA -- "notify = false / NEUTRAL" --> AC[Skip Telegram]
+    end
+
+    AB --> AD[(ai_research_output.json)]
+    AC --> AD
+    AD --> AE{More pending?}
+    AE -- Yes --> F
+    AE -- No --> E
+
+    subgraph llm_fallback [Groq Model Fallback — every call_llm]
+        direction LR
+        P1[Primary\nGROQ_MODEL] -- fails --> P2[Backup 1\nGROQ_BACKUP_MODEL_1]
+        P2 -- fails --> P3[Backup 2\nGROQ_BACKUP_MODEL_2]
+        P3 -- fails --> P4([Raise error])
+    end
 ```
 
 ## Project Structure
