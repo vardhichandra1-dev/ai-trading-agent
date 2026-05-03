@@ -1,173 +1,283 @@
 # AI-Driven Indian Stock Market Agent
 
-Two parallel data-ingestion pipelines feed different information streams into the same Telegram delivery channel:
+Two parallel data-ingestion pipelines run simultaneously inside a single LangGraph, both delivering to the same Telegram channel.
 
-| Pipeline | Entry point | Data source | Output |
-|----------|-------------|-------------|--------|
-| **NSE Announcements** | `main.py` | NSE corporate announcements API + PDF attachments | BUY / SELL / NEUTRAL trading signals |
-| **Twitter News** | `twitter_main.py` | X/Twitter accounts (CNBCTV18News, NDTVProfitIndia, ETNOWlive, RedboxGlobal) | Plain-English news summaries |
+| Pipeline | Data source | Telegram output |
+|----------|-------------|-----------------|
+| **NSE Announcements** | NSE corporate announcements API + PDF attachments | BUY / SELL / NEUTRAL trading signal with full reasoning |
+| **Twitter / X News** | CNBCTV18News · NDTVProfitIndia · ETNOWlive · RedboxGlobal | Plain-English news digests — no trading signals |
 
-Both pipelines are independent — they share only `services/llm_service.py` and `services/telegram_service.py`.
+---
+
+## Quick Start
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Copy and fill in credentials
+cp .env.example .env   # or create .env manually (see Environment section)
+
+# Run both pipelines together (recommended)
+python run.py
+
+# Single cycle and exit
+python run.py --once
+```
+
+> Standalone pipeline entry points also work independently:
+> ```bash
+> python main.py            # NSE pipeline only
+> python twitter_main.py    # Twitter pipeline only
+> ```
+
+---
+
+## Combined Graph Architecture
+
+```mermaid
+flowchart TD
+    A([run.py — start cycle]) --> B[refresh\nFetch latest NSE announcements\nUpdate nse_master.json]
+
+    B --> C[nse\nNSE announcements pipeline]
+    B --> D[twitter\nTwitter summarisation pipeline]
+
+    C -->|BUY / SELL / NEUTRAL signal| E[(ai_research_output.json)]
+    C -->|If notify=true| F([Telegram — NSE Alert])
+
+    D -->|Summaries digest| G[(twitter_output.json)]
+    D -->|Up to 4 digest messages| H([Telegram — News Digest])
+
+    E --> I([combined_runs.json])
+    G --> I
+
+    I --> J{NSE found a record?}
+    J -- Yes --> A
+    J -- No --> K[Sleep 2–5 min]
+    K --> A
+```
+
+Both `nse` and `twitter` nodes execute **in parallel** — LangGraph threads them simultaneously after `refresh` completes. Each pipeline sends to Telegram independently; neither waits for the other.
 
 ---
 
 ## Pipeline 1 — NSE Announcements Agent
 
-### Workflow
+Processes one NSE corporate announcement per cycle, downloads its PDF disclosure, generates a Groq-backed trading signal, optionally validates with Tavily web search, and sends a Telegram alert for fresh actionable signals.
+
+### LangGraph
 
 ```mermaid
 flowchart TD
-    A([Start]) --> B[Fetch NSE announcements\nnse_fetcher]
-    B --> C[(nse_master.json)]
-    C --> D{Pending records?}
-    D -- No --> E[Sleep 5–10 min] --> B
-    D -- Yes --> F
+    A([Start]) --> B[pdf_node\nDownload PDF attachment]
+    B --> C[pdf_summary_node\nExtract text page-by-page]
 
-    subgraph pipeline [LangGraph — one stock at a time]
-        F[Download PDF attachment\npdf_node]
-        F --> G[Page-by-page extraction\npdf_service]
-        G --> H{PDF size}
+    C --> D{PDF size}
+    D -- "≤ threshold" --> E[Pass through\nkeyword-aware context selection]
+    D -- "> threshold" --> F[Chunk PDF with page labels\nCall Groq per chunk\nBatch-reduce → cache]
 
-        H -- "Short PDF" --> I[pdf_summary_node\nPass through]
-        H -- "Large PDF" --> J[Chunk PDF]
-        J --> K[call_llm per chunk\nGroq primary → backup1 → backup2]
-        K --> L[Batch-reduce summaries\npdf_summaries.json cache]
-        L --> O
+    E --> G[signal_node\nBUY / SELL / NEUTRAL via Groq]
+    F --> G
 
-        I --> O[signal_node\nBUY / SELL / NEUTRAL via Groq]
-        O --> Q{Signal}
+    G --> H{Signal}
+    H -- NEUTRAL --> I[report_node]
+    H -- "BUY / SELL" --> J[validation_node\nGenerate queries via Groq\nTavily web search 3–5 queries]
 
-        Q -- NEUTRAL --> V[report_node]
-        Q -- "BUY / SELL" --> R[validation_node\nTavily web search]
-        R --> S{Results?}
-        S -- None --> U[notify = false] --> AA
-        S -- Found --> W[Validation LLM]
-        W --> X{Fresh?}
-        X -- Already reflected --> Y[notify = false] --> AA
-        X -- Fresh --> Z[notify = true] --> AA
+    J --> K{Search results?}
+    K -- None --> L[notify = false]
+    K -- Found --> M[Validation LLM\nconfirm freshness]
 
-        V --> AA[telegram_node]
-        AA -- "notify = true" --> AB[Send Telegram alert]
-        AA -- "notify = false" --> AC[Skip]
-    end
+    M --> N{Fresh news?}
+    N -- "Already reflected" --> O[Downgrade / notify = false]
+    N -- "Fresh signal" --> P[notify = true]
 
-    AB --> AD[(ai_research_output.json)]
-    AC --> AD
-    AD --> AE{More pending?}
-    AE -- Yes --> F
-    AE -- No --> E
+    L --> I
+    O --> I
+    P --> I
+
+    I --> Q[telegram_node\nSend if notify = true]
+    Q --> R[(ai_research_output.json)]
 ```
 
-### Run
+### Signal decision logic
 
-```bash
-python main.py          # continuous loop
-python main.py --once   # single record then exit
+- **BUY / SELL** — proceeds to Tavily validation. If no search results are found, or the LLM determines the event was already public (`already_reflected = true`), `notify` is set to `false` and no Telegram alert is sent.
+- **NEUTRAL** — skips Tavily entirely; no Telegram alert.
+- Telegram is only triggered when: signal is BUY or SELL **and** `notify = true`.
+
+### Groq model fallback
+
+Every `call_llm` call attempts models in order — if the primary returns an HTTP error or empty response the next is tried automatically:
+
+```
+GROQ_MODEL  →  GROQ_BACKUP_MODEL_1  →  GROQ_BACKUP_MODEL_2  →  raise RuntimeError
 ```
 
-### Key files
+### Large PDF handling
 
-| File | Role |
-|------|------|
-| [main.py](main.py) | Run loop, dedup processed records, writes `data/ai_research_output.json` |
-| [nse_fetcher.py](nse_fetcher.py) | Fetches NSE API, normalises fields, maintains `data/nse_master.json` |
-| [graph.py](graph.py) | LangGraph wiring |
-| [state.py](state.py) | `GraphState` TypedDict |
-| [nodes/pdf_node.py](nodes/pdf_node.py) | Downloads PDF attachment |
-| [nodes/pdf_summary_node.py](nodes/pdf_summary_node.py) | Chunk-summarises large PDFs, caches in `data/pdf_summaries.json` |
-| [nodes/signal_node.py](nodes/signal_node.py) | Generates BUY / SELL / NEUTRAL via Groq |
-| [nodes/validation_node.py](nodes/validation_node.py) | Validates actionable signals with Tavily |
-| [nodes/report_node.py](nodes/report_node.py) | Formats final report |
-| [nodes/telegram_node.py](nodes/telegram_node.py) | Sends Telegram alert when `notify=true` |
+| PDF size | Behaviour |
+|----------|-----------|
+| ≤ `PDF_SUMMARY_THRESHOLD_CHARS` | Passed directly to the signal prompt via keyword-aware compact context (head + tail + event-relevant snippets) |
+| > `PDF_SUMMARY_THRESHOLD_CHARS` | Split into `PDF_SUMMARY_CHUNK_CHARS` chunks, each labelled `[PAGE N]`. Each chunk summarised by Groq independently. Chunk summaries batch-reduced until ≤ `PDF_SUMMARY_MAX_CHARS`. Result SHA-256 cached in `data/pdf_summaries.json`. |
+
+Scanned / image pages (< 30 characters) are detected and skipped. `PDF_MAX_PAGES` caps extraction on very large documents.
 
 ---
 
 ## Pipeline 2 — Twitter News Summarisation Agent
 
-### Workflow
+Scrapes tweets from four high-credibility Indian financial accounts, filters noise, deduplicates, tags detected stocks, summarises each update in one sentence via Groq, and sends digest messages to Telegram.
+
+**No trading signals are generated from Twitter data.**
+
+### LangGraph
 
 ```mermaid
 flowchart LR
-    A([Start]) --> B[tweet_collector_node\ntwscrape — 4 accounts × 50 tweets]
-    B --> C[noise_filter_node\nRemove URLs/emojis\nReject ads/politics\nKeep signal keywords]
-    C --> D[dedup_node\nTF-IDF cosine similarity\nthreshold 0.85]
-    D --> E[stock_detector_node\nTag each tweet with NSE symbols]
-    E --> F[tweet_summarizer_node\nBatch LLM — 10 tweets per call\nOne sentence per tweet]
-    F --> G[twitter_telegram_node\nDigest messages — 5 updates each\nMax 4 messages per run]
+    A([Start]) --> B[tweet_collector_node\ntwscrape async\n4 accounts × 50 tweets]
+    B --> C[noise_filter_node\nStrip URLs · emojis · whitespace\nReject ads / politics / sports\nKeep financial signal keywords]
+    C --> D[dedup_node\nTF-IDF cosine similarity\nthreshold 0.85\nhigher-weight account wins]
+    D --> E[stock_detector_node\nTag each tweet with\ndetected NSE symbols]
+    E --> F[tweet_summarizer_node\nBatch 10 tweets per Groq call\nOne sentence per tweet]
+    F --> G[twitter_telegram_node\n5 summaries per message\nMax 4 messages per run\nSave to twitter_output.json]
     G --> H([Telegram])
 ```
 
-**No trading signals are generated from Twitter.** The pipeline summarises news updates and delivers them as readable digests.
+### Deduplication logic
 
-### Telegram digest format
+When two tweets exceed 0.85 cosine similarity (TF-IDF vectors), only the one from the higher-weight account is kept. This prevents the same story appearing once per source.
 
-```
-📰 Market Updates  |  02 May 2026 09:15 UTC  |  run a3f8b1c2
+### Target accounts
 
-• [CNBCTV18News]  RELIANCE
-  Reliance Industries announces ₹5,000 crore green energy capex for FY2027.
-
-• [ETNOWlive]  TCS, INFY
-  TCS and Infosys Q4 results beat street estimates; combined net profit up 9% YoY.
-
-• [NDTVProfitIndia]  SBIN
-  SBI reports record net profit of ₹18,400 crore for Q4 FY2026.
-```
-
-### Run
-
-```bash
-python twitter_main.py          # continuous loop (2–5 min interval)
-python twitter_main.py --once   # single cycle then exit
-```
-
-### Key files
-
-| File | Role |
-|------|------|
-| [twitter_main.py](twitter_main.py) | Run loop, prints per-run summary |
-| [twitter_graph.py](twitter_graph.py) | LangGraph wiring for 6 nodes |
-| [twitter_state.py](twitter_state.py) | `TwitterState` TypedDict |
-| [nodes/tweet_collector_node.py](nodes/tweet_collector_node.py) | Calls `twitter_scraper_service.fetch_tweets()` |
-| [nodes/noise_filter_node.py](nodes/noise_filter_node.py) | Cleans text, applies keyword + reject-pattern filters |
-| [nodes/dedup_node.py](nodes/dedup_node.py) | Pure-Python TF-IDF deduplication |
-| [nodes/stock_detector_node.py](nodes/stock_detector_node.py) | Tags tweets with detected NSE symbols |
-| [nodes/tweet_summarizer_node.py](nodes/tweet_summarizer_node.py) | Batched Groq summarisation (10 tweets/call) |
-| [nodes/twitter_telegram_node.py](nodes/twitter_telegram_node.py) | Sends digest messages (5 updates/message, max 4/run) |
-| [services/twitter_scraper_service.py](services/twitter_scraper_service.py) | `twscrape` async wrapper, stores session in `data/twscrape.db` |
-| [services/stock_detector_service.py](services/stock_detector_service.py) | NSE master lookup + 50+ hardcoded company-name aliases |
-| [services/dedup_service.py](services/dedup_service.py) | TF-IDF cosine similarity (no external deps) |
-
-### Target accounts and weights
-
-| Account | Weight |
-|---------|--------|
+| Account | Scrape weight |
+|---------|--------------|
 | CNBCTV18News | 0.90 |
 | ETNOWlive | 0.85 |
 | NDTVProfitIndia | 0.80 |
 | RedboxGlobal | 0.75 |
 
-Account weights are metadata only in this pipeline (used for dedup tie-breaking — higher-weight tweet survives when two are near-duplicate).
+### Telegram digest format
+
+```
+📰 Market Updates  |  03 May 2026 09:15 UTC  |  run a3f8b1c2
+
+• [CNBCTV18News]  RELIANCE
+  Reliance Industries announces ₹5,000 crore green energy capex for FY2027.
+
+• [ETNOWlive]  TCS, INFY
+  TCS and Infosys Q4 results beat estimates; combined net profit up 9% YoY.
+
+• [NDTVProfitIndia]  SBIN
+  SBI reports record quarterly net profit of ₹18,400 crore for Q4 FY2026.
+```
 
 ---
 
-## Shared Services
+## Data Files
 
-| Service | Used by |
-|---------|---------|
-| [services/llm_service.py](services/llm_service.py) | Both pipelines — Groq with primary + two backup model fallback |
-| [services/telegram_service.py](services/telegram_service.py) | Both pipelines — Telegram Bot API sender |
-| [services/pdf_service.py](services/pdf_service.py) | NSE pipeline only |
-| [services/tavily_service.py](services/tavily_service.py) | NSE pipeline only |
+All outputs are written to `data/` and kept newest-first. Each file is capped to prevent unbounded growth.
+
+### `data/nse_master.json`
+Raw NSE corporate announcements fetched from the NSE API. Refreshed at the start of every combined cycle.
+```json
+[
+  {
+    "SYMBOL": "RELIANCE",
+    "COMPANY NAME": "Reliance Industries Limited",
+    "SUBJECT": "Acquisition",
+    "DETAILS": "...",
+    "BROADCAST DATE/TIME": "2026-05-03T09:00:00",
+    "ATTACHMENT": "https://nsearchives.nseindia.com/..."
+  }
+]
+```
+
+### `data/seen_ids.json`
+Set of NSE announcement IDs already ingested — prevents re-processing the same disclosure.
+
+### `data/pdf_summaries.json`
+SHA-256 keyed cache of large-PDF chunk summaries. Re-processing the same PDF file skips Groq calls entirely.
+
+### `data/ai_research_output.json`
+Full LangGraph result for every processed NSE announcement. Newest entry first, unbounded.
+```json
+[
+  {
+    "symbol": "RELIANCE",
+    "signal": "BUY",
+    "confidence": "High",
+    "analysis": "...",
+    "report": "...",
+    "notify": true,
+    "telegram_sent": true,
+    "status": "SUCCESS"
+  }
+]
+```
+
+### `data/twitter_output.json`
+One entry per Twitter pipeline run. Newest first, capped at 500 runs. Written by `twitter_telegram_node` — captured for both standalone and combined runs.
+```json
+[
+  {
+    "run_id": "a3f8b1c2",
+    "timestamp": "2026-05-03T09:15:42+00:00",
+    "pipeline_stats": {
+      "raw_tweets": 200,
+      "filtered_tweets": 45,
+      "deduplicated_tweets": 38,
+      "summaries": 12,
+      "alerts_sent": 3
+    },
+    "summaries": [
+      {
+        "author": "CNBCTV18News",
+        "stock_tags": ["RELIANCE"],
+        "summary": "Reliance announces ₹5,000 crore green energy capex.",
+        "timestamp": "2026-05-03T09:10:00+00:00",
+        "tweet_id": "1234567890"
+      }
+    ],
+    "telegram_errors": []
+  }
+]
+```
+
+### `data/combined_runs.json`
+One entry per combined `run.py` cycle. Newest first, capped at 500 runs. Written by `run.py` after every cycle regardless of outcome.
+```json
+[
+  {
+    "run_id": "a3f8b1c2",
+    "timestamp": "2026-05-03T09:15:42",
+    "nse": {
+      "status": "SUCCESS",
+      "symbol": "RELIANCE",
+      "signal": "BUY",
+      "telegram_sent": true,
+      "error": ""
+    },
+    "twitter": {
+      "status": "SUCCESS",
+      "summaries_count": 12,
+      "alerts_sent": 3,
+      "error": ""
+    }
+  }
+]
+```
+
+### `data/twscrape.db`
+SQLite session store created by `twscrape` on first run. Persists authenticated Twitter sessions so re-login is not needed on subsequent runs.
 
 ---
 
 ## Environment Variables
 
-Create a `.env` file in the project root:
+Create `.env` in the project root:
 
 ```env
-# ── Groq LLM ────────────────────────────────────────────────────────────────
+# ── Groq LLM (both pipelines) ────────────────────────────────────────────────
 GROQ_API_KEY=
 GROQ_MODEL=openai/gpt-oss-120b
 GROQ_BACKUP_MODEL_1=llama-3.3-70b-versatile
@@ -176,12 +286,13 @@ GROQ_TIMEOUT_SECONDS=90
 GROQ_QUERY_TIMEOUT_SECONDS=90
 GROQ_VALIDATION_TIMEOUT_SECONDS=120
 
-# ── Telegram ─────────────────────────────────────────────────────────────────
+# ── Telegram (both pipelines) ─────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 
-# ── NSE pipeline ─────────────────────────────────────────────────────────────
+# ── NSE pipeline ──────────────────────────────────────────────────────────────
 TAVILY_API_KEY=
+
 PDF_MAX_PAGES=200
 SIGNAL_PDF_MAX_CHARS=18000
 PDF_SUMMARY_THRESHOLD_CHARS=18000
@@ -193,14 +304,12 @@ PDF_SUMMARY_FINAL_NUM_PREDICT=700
 PDF_SUMMARY_BATCH_SIZE=6
 
 # ── Twitter pipeline ──────────────────────────────────────────────────────────
-# Semicolon-separated list of Twitter accounts to scrape with
+# One or more Twitter/X accounts for twscrape to authenticate with.
 # Format: username,password,email,email_password
+# Multiple accounts separated by semicolons:
 TWITTER_ACCOUNTS=user1,pass1,email1,epass1;user2,pass2,email2,epass2
 TWEETS_PER_ACCOUNT=50
 ```
-
-> **twscrape note:** `twscrape` requires one or more real Twitter/X accounts to authenticate.  
-> After first run the session is cached at `data/twscrape.db` — no re-login needed on subsequent runs.
 
 ---
 
@@ -208,71 +317,77 @@ TWEETS_PER_ACCOUNT=50
 
 ```
 ai_research_agent/
-├── main.py                          # NSE pipeline entry point
-├── twitter_main.py                  # Twitter pipeline entry point
-├── graph.py                         # NSE LangGraph
-├── twitter_graph.py                 # Twitter LangGraph
-├── state.py                         # NSE state
-├── twitter_state.py                 # Twitter state
-├── nse_fetcher.py                   # NSE API fetcher
+│
+│  ── Entry points ──────────────────────────────────────────────────────
+├── run.py                           # ★ PRIMARY — both pipelines in parallel
+├── main.py                          # NSE pipeline standalone
+├── twitter_main.py                  # Twitter pipeline standalone
+│
+│  ── Combined graph ────────────────────────────────────────────────────
+├── combined_graph.py                # refresh → [nse ‖ twitter] → END
+├── combined_state.py                # CombinedState TypedDict
+│
+│  ── NSE pipeline ───────────────────────────────────────────────────────
+├── graph.py                         # NSE LangGraph (6 nodes)
+├── state.py                         # GraphState TypedDict
+├── nse_fetcher.py                   # NSE API fetcher + nse_master.json writer
+│
+│  ── Twitter pipeline ──────────────────────────────────────────────────
+├── twitter_graph.py                 # Twitter LangGraph (6 nodes)
+├── twitter_state.py                 # TwitterState TypedDict
 │
 ├── nodes/
-│   ├── pdf_node.py                  # NSE: download PDF
-│   ├── pdf_summary_node.py          # NSE: chunk-summarise large PDFs
-│   ├── signal_node.py               # NSE: BUY/SELL/NEUTRAL signal
-│   ├── validation_node.py           # NSE: Tavily validation
-│   ├── report_node.py               # NSE: format report
-│   ├── telegram_node.py             # NSE: Telegram alert
-│   ├── tweet_collector_node.py      # Twitter: fetch tweets
-│   ├── noise_filter_node.py         # Twitter: clean + filter
-│   ├── dedup_node.py                # Twitter: deduplication
-│   ├── stock_detector_node.py       # Twitter: tag with NSE symbols
-│   ├── tweet_summarizer_node.py     # Twitter: LLM summarisation
-│   └── twitter_telegram_node.py    # Twitter: digest to Telegram
+│   │  NSE nodes
+│   ├── pdf_node.py                  # Download PDF attachment
+│   ├── pdf_summary_node.py          # Chunk-summarise large PDFs; cache results
+│   ├── signal_node.py               # Generate BUY / SELL / NEUTRAL via Groq
+│   ├── validation_node.py           # Validate signal with Tavily web search
+│   ├── report_node.py               # Format final report string
+│   ├── telegram_node.py             # Send Telegram alert when notify=true
+│   │
+│   │  Twitter nodes
+│   ├── tweet_collector_node.py      # Fetch tweets via twscrape
+│   ├── noise_filter_node.py         # Clean text; keep only financial keywords
+│   ├── dedup_node.py                # TF-IDF cosine deduplication
+│   ├── stock_detector_node.py       # Tag tweets with NSE symbols
+│   ├── tweet_summarizer_node.py     # Batch Groq summarisation (10 tweets/call)
+│   └── twitter_telegram_node.py     # Send digests; write twitter_output.json
 │
 ├── services/
-│   ├── llm_service.py               # Groq API (shared)
-│   ├── telegram_service.py          # Telegram Bot API (shared)
-│   ├── pdf_service.py               # PDF download + extraction (NSE)
-│   ├── tavily_service.py            # Tavily web search (NSE)
-│   ├── twitter_scraper_service.py   # twscrape wrapper (Twitter)
-│   ├── stock_detector_service.py    # NSE symbol lookup (Twitter)
-│   └── dedup_service.py             # TF-IDF cosine dedup (Twitter)
+│   ├── llm_service.py               # Groq API — primary + 2 backup models
+│   ├── telegram_service.py          # Telegram Bot API
+│   ├── pdf_service.py               # PDF download + page-by-page extraction
+│   ├── tavily_service.py            # Tavily web search
+│   ├── twitter_scraper_service.py   # twscrape async wrapper
+│   ├── stock_detector_service.py    # NSE symbol lookup + 50+ company aliases
+│   └── dedup_service.py             # Pure-Python TF-IDF cosine similarity
 │
 ├── utils/
-│   ├── logger.py
-│   └── retry.py
+│   ├── logger.py                    # log(stage, message) helper
+│   └── retry.py                     # Retry decorator
 │
-└── data/
-    ├── nse_master.json              # NSE announcements cache
-    ├── ai_research_output.json      # NSE signal results
-    ├── pdf_summaries.json           # PDF summary cache
+└── data/                            # All outputs — never committed to git
+    ├── nse_master.json              # NSE announcements cache (auto-refreshed)
     ├── seen_ids.json                # Processed NSE record IDs
-    └── twscrape.db                  # Twitter session store
+    ├── pdf_summaries.json           # SHA-256 keyed PDF summary cache
+    ├── ai_research_output.json      # NSE signal results (full state per stock)
+    ├── twitter_output.json          # Twitter summaries per run (capped 500)
+    ├── combined_runs.json           # Combined cycle log (capped 500)
+    └── twscrape.db                  # Twitter session store (SQLite)
 ```
 
 ---
 
-## Large PDF Handling (NSE Pipeline)
-
-**Short PDFs** (`≤ PDF_SUMMARY_THRESHOLD_CHARS`): passed directly into the signal prompt via keyword-aware compact context selection. Head, tail, and event-relevant snippets are preserved within `SIGNAL_PDF_MAX_CHARS`.
-
-**Large PDFs** (`> PDF_SUMMARY_THRESHOLD_CHARS`): split into `PDF_SUMMARY_CHUNK_CHARS` chunks each labelled with PDF page range. Each chunk is summarised by Groq independently. Chunk summaries are batch-reduced until one combined summary fits within `PDF_SUMMARY_MAX_CHARS`. Results are SHA-256 cached in `data/pdf_summaries.json`.
-
-**Extraction**: text is read page-by-page with `[PAGE N]` markers. Pages with fewer than 30 characters (scanned/image) are skipped. `PDF_MAX_PAGES` caps extraction on very large documents.
-
----
-
-## Groq Model Fallback (Both Pipelines)
-
-Every `call_llm` call attempts models in order:
+## Dependencies
 
 ```
-Primary (GROQ_MODEL)  →  Backup 1  →  Backup 2  →  raise RuntimeError
+langchain
+langgraph
+requests
+python-dotenv
+pymupdf
+pandas
+twscrape
 ```
 
-All three models are configurable via environment variables.
-
----
-
-![alt text](image.png)
+Install: `pip install -r requirements.txt`
