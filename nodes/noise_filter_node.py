@@ -68,6 +68,7 @@ def noise_filter_node(state: dict) -> dict:
                 "clean_text": clean,
                 "author": author,
                 "created_at": tweet["created_at"],
+                "source": tweet.get("source", ""),
             })
 
     state["filtered_tweets"] = filtered
