@@ -142,6 +142,9 @@ def twitter_telegram_node(state: dict) -> dict:
         if is_redbox or has_content:
             sendable.append(s)
 
+    # Sort by tweet timestamp (oldest first) so Telegram messages read chronologically
+    sendable.sort(key=lambda s: s.get("timestamp", ""))
+
     log("TELEGRAM", f"{len(all_summaries)} total — {len(new_summaries)} new — {len(sendable)} to send")
 
     sent = 0

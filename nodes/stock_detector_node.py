@@ -1,9 +1,11 @@
-from services.stock_detector_service import detect_stocks
+from services.stock_detector_service import detect_stocks, reload_lookup
 from utils.logger import log
 
 
 def stock_detector_node(state: dict) -> dict:
     """Tag each tweet with detected NSE symbols. No grouping or signal logic."""
+    # Reload NSE master every run so tags reflect latest nse_master.json data
+    reload_lookup()
     tweets = state.get("deduplicated_tweets", [])
     tagged = []
 

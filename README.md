@@ -137,10 +137,10 @@ Scrapes tweets from four high-credibility Indian financial accounts using Playwr
 flowchart LR
     A([Start]) --> B[tweet_collector_node\nPlaywright → Nitter instances\n4 accounts × 20 tweets]
     B --> C[noise_filter_node\nStrip URLs · emojis · whitespace\nReject ads / politics / sports\nKeep financial signal keywords]
-    C --> D[dedup_node\nTF-IDF cosine similarity\nthreshold 0.85\nhigher-weight account wins]
-    D --> E[stock_detector_node\nTag each tweet with\ndetected NSE symbols]
+    C --> D[dedup_node\nTF-IDF cosine similarity\nthreshold 0.85\nfirst-seen order wins]
+    D --> E[stock_detector_node\nReload NSE master each run\nTag each tweet with detected NSE symbols]
     E --> F[tweet_summarizer_node\nBatch 10 tweets per Groq call\nOne sentence per tweet]
-    F --> G[twitter_telegram_node\nFilter already-seen IDs\n5 summaries per message · max 4 messages\nUpdate seen_tweet_ids.json\nSave to twitter_output.json]
+    F --> G[twitter_telegram_node\nFilter already-seen IDs\nSort chronologically oldest→newest\n5 summaries per message · max 4 messages\nUpdate seen_tweet_ids.json\nSave to twitter_output.json]
     G --> H([Telegram])
 ```
 
@@ -164,7 +164,7 @@ nitter.kavin.rocks → nitter.cz → nitter.it → x.com (last resort)
 
 | Layer | Scope | Method |
 |-------|-------|--------|
-| Within-run | Same pipeline cycle | TF-IDF cosine similarity ≥ 0.85; first-seen wins |
+| Within-run | Same pipeline cycle | TF-IDF cosine similarity ≥ 0.85; first-seen order wins (no account weighting) |
 | Cross-run | Across all previous runs | Content-stable `tweet_id` (MD5 of normalised text + author) checked against `data/seen_tweet_ids.json` |
 
 `tweet_id` is derived from normalised tweet content — not timestamps — so it stays stable even if Playwright renders the page slightly differently each run. IDs are recorded only after a Telegram message sends successfully.
@@ -180,19 +180,21 @@ nitter.kavin.rocks → nitter.cz → nitter.it → x.com (last resort)
 
 ### Telegram digest format
 
+Messages are sent in chronological order (oldest tweet first) so the digest reads like a timeline.
+
 ```
 📊 Market Flash  ·  04 May 2026  ·  11:13 UTC
+
+@REDBOXINDIA
+POWER TARIFFS LIKELY TO RISE AS REGULATORS ACT ON SC ORDER - FE
 
 @CNBCTV18Live
 Marico Q4: Revenue ₹3,325 Cr, EBITDA ₹527 Cr, margin 15.8% vs poll
 🏷 MARICO
 
-@REDBOXINDIA
-POWER TARIFFS LIKELY TO RISE AS REGULATORS ACT ON SC ORDER - FE
-
-@CNBCTV18News
+@ETNOWlive
 L&T wins ₹2,500–5,000 Cr order from NTPC
-🏷 LT  ·  BHARATCOAL  ·  COALINDIA
+🏷 LT  ·  COALINDIA
 
 ─────────────────────────
 🔄 3 new updates  ·  `a3f8b1c2`
@@ -343,9 +345,9 @@ ai_research_agent/
 │   ├── tweet_collector_node.py      # Fetch tweets via Playwright+Nitter
 │   ├── noise_filter_node.py         # Clean text; keep only financial keywords
 │   ├── dedup_node.py                # TF-IDF cosine deduplication (within-run)
-│   ├── stock_detector_node.py       # Tag tweets with NSE symbols
+│   ├── stock_detector_node.py       # Reload NSE master; tag tweets with NSE symbols
 │   ├── tweet_summarizer_node.py     # Batch Groq summarisation (10 tweets/call)
-│   └── twitter_telegram_node.py     # Filter seen IDs; send digests; write output
+│   └── twitter_telegram_node.py     # Filter seen IDs; sort chronologically; send digests; write output
 │
 ├── services/
 │   ├── llm_service.py               # Groq API — primary + 2 backup models
@@ -367,8 +369,7 @@ ai_research_agent/
     ├── ai_research_output.json      # NSE signal results (full state per stock)
     ├── twitter_output.json          # Twitter run log with full tweet records
     ├── seen_tweet_ids.json          # Tweet IDs already sent to Telegram
-    ├── combined_runs.json           # Combined cycle log (capped 500)
-    └── twscrape.db                  # (legacy — no longer used)
+    └── combined_runs.json           # Combined cycle log (capped 500)
 ```
 
 ---
