@@ -1,17 +1,15 @@
 import hashlib
 import os
+import re
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
-ACCOUNT_WEIGHTS: Dict[str, float] = {
-    "CNBCTV18News": 0.90,
-    "CNBCTV18Live": 0.90,
-    "NDTVProfitIndia": 0.80,
-    "ETNOWlive": 0.85,
-    "REDBOXINDIA": 0.75,
-}
-
-TARGET_ACCOUNTS = list(ACCOUNT_WEIGHTS.keys())
+TARGET_ACCOUNTS = [
+    "CNBCTV18Live",
+    "NDTVProfitIndia",
+    "ETNOWlive",
+    "REDBOXINDIA",
+]
 DEFAULT_TWEETS_PER_ACCOUNT = 20
 
 NITTER_INSTANCES = [
@@ -30,16 +28,10 @@ _UA = (
 )
 
 
-def _weight_for(author: str) -> float:
-    for handle, weight in ACCOUNT_WEIGHTS.items():
-        if handle.lower() == author.lower():
-            return weight
-    return 0.70
-
-
-def _make_id(text: str, author: str, created_at: str) -> str:
-    raw = f"{author}:{created_at}:{text[:80]}"
-    return hashlib.md5(raw.encode()).hexdigest()[:16]
+def _make_id(text: str, author: str) -> str:
+    # Normalise whitespace/punctuation so the ID is stable across re-scrapes
+    normalized = re.sub(r"\W+", " ", text.lower()).strip()[:120]
+    return hashlib.md5(f"{author.lower()}:{normalized}".encode()).hexdigest()[:16]
 
 
 def _parse_nitter_html(html: str, username: str, limit: int, source_label: str) -> List[dict]:
@@ -59,11 +51,10 @@ def _parse_nitter_html(html: str, username: str, limit: int, source_label: str) 
             else datetime.now(timezone.utc).isoformat()
         )
         tweets.append({
-            "tweet_id": _make_id(text, username, ts),
+            "tweet_id": _make_id(text, username),
             "raw_text": text,
             "created_at": ts,
             "author": username,
-            "account_weight": _weight_for(username),
             "source": source_label,
         })
     return tweets
@@ -144,11 +135,10 @@ def _fetch_account(username: str, limit: int) -> Tuple[List[dict], dict]:
                     except Exception:
                         pass
                     tweets.append({
-                        "tweet_id": _make_id(text, username, ts),
+                        "tweet_id": _make_id(text, username),
                         "raw_text": text,
                         "created_at": ts,
                         "author": username,
-                        "account_weight": _weight_for(username),
                         "source": "playwright+xcom",
                     })
                 page.close()

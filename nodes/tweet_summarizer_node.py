@@ -62,14 +62,19 @@ def tweet_summarizer_node(state: dict) -> dict:
             batch_summaries = ["Summary unavailable."] * len(batch)
 
         for tweet, summary in zip(batch, batch_summaries):
-            # Embed summary directly into tweet dict for unified output record
             tweet["summary"] = summary if summary else "Summary unavailable."
 
-            if summary and summary != "No market update.":
+            is_redbox = tweet.get("author", "").upper() == "REDBOXINDIA"
+            has_summary = summary and summary != "No market update."
+
+            if is_redbox or has_summary:
                 summaries.append({
                     "author": tweet["author"],
                     "stock_tags": tweet.get("stock_tags", []),
                     "summary": summary,
+                    # raw_text kept so Telegram can display it when summary is absent
+                    "raw_text": tweet.get("raw_text", ""),
+                    "clean_text": tweet.get("clean_text", ""),
                     "timestamp": tweet["created_at"],
                     "tweet_id": tweet["tweet_id"],
                 })

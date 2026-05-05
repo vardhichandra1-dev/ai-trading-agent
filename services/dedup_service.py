@@ -44,8 +44,8 @@ def deduplicate(tweets: List[dict], threshold: float = 0.85) -> List[dict]:
     if len(tweets) <= 1:
         return list(tweets)
 
-    # Sort by account weight desc so higher-authority tweets survive dedup
-    ordered = sorted(tweets, key=lambda t: t.get("account_weight", 0.70), reverse=True)
+    # No account weights — preserve original order; first occurrence wins on near-duplicates
+    ordered = list(tweets)
 
     token_lists = [_tokenize(t.get("clean_text", "")) for t in ordered]
     idf = _build_idf(token_lists)

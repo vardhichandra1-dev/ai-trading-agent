@@ -58,15 +58,16 @@ def noise_filter_node(state: dict) -> dict:
     filtered = []
 
     for tweet in raw:
+        author = tweet.get("author", "")
         clean = _clean(tweet.get("raw_text", ""))
-        if _is_relevant(clean):
+        # REDBOXINDIA: every update passes — no keyword gating
+        if author.upper() == "REDBOXINDIA" or _is_relevant(clean):
             filtered.append({
                 "tweet_id": tweet["tweet_id"],
                 "raw_text": tweet["raw_text"],
                 "clean_text": clean,
-                "author": tweet["author"],
+                "author": author,
                 "created_at": tweet["created_at"],
-                "account_weight": tweet.get("account_weight", 0.70),
             })
 
     state["filtered_tweets"] = filtered

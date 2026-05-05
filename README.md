@@ -5,7 +5,7 @@ Two parallel data-ingestion pipelines run simultaneously inside a single LangGra
 | Pipeline | Data source | Telegram output |
 |----------|-------------|-----------------|
 | **NSE Announcements** | NSE corporate announcements API + PDF attachments | BUY / SELL / NEUTRAL trading signal with full reasoning |
-| **Twitter / X News** | CNBCTV18News · CNBCTV18Live · NDTVProfitIndia · ETNOWlive · REDBOXINDIA | Plain-English news digests — new tweets only, no duplicates |
+| **Twitter / X News** | CNBCTV18Live · NDTVProfitIndia · ETNOWlive · REDBOXINDIA | Plain-English news digests — new tweets only, no duplicates |
 
 ---
 
@@ -164,38 +164,41 @@ nitter.kavin.rocks → nitter.cz → nitter.it → x.com (last resort)
 
 | Layer | Scope | Method |
 |-------|-------|--------|
-| Within-run | Same pipeline cycle | TF-IDF cosine similarity ≥ 0.85; higher-weight account wins |
-| Cross-run | Across all previous runs | Exact `tweet_id` match against `data/seen_tweet_ids.json` |
+| Within-run | Same pipeline cycle | TF-IDF cosine similarity ≥ 0.85; first-seen wins |
+| Cross-run | Across all previous runs | Content-stable `tweet_id` (MD5 of normalised text + author) checked against `data/seen_tweet_ids.json` |
 
-Only tweets whose `tweet_id` does not appear in `seen_tweet_ids.json` are sent to Telegram. IDs are recorded after each successful send.
+`tweet_id` is derived from normalised tweet content — not timestamps — so it stays stable even if Playwright renders the page slightly differently each run. IDs are recorded only after a Telegram message sends successfully.
 
 ### Target accounts
 
-| Account | Weight |
-|---------|--------|
-| CNBCTV18News | 0.90 |
-| CNBCTV18Live | 0.90 |
-| ETNOWlive | 0.85 |
-| NDTVProfitIndia | 0.80 |
-| REDBOXINDIA | 0.75 |
+| Account | Filter rule |
+|---------|-------------|
+| CNBCTV18Live | Stock-market keyword filter |
+| ETNOWlive | Stock-market keyword filter |
+| NDTVProfitIndia | Stock-market keyword filter |
+| REDBOXINDIA | **No filter — every tweet reaches Telegram** |
 
 ### Telegram digest format
 
 ```
 📊 Market Flash  ·  04 May 2026  ·  11:13 UTC
 
-1. Larsen & Toubro wins ₹2,500–5,000 Cr infra order from NTPC
-    🏷 LT  BHARATCOAL  COALINDIA  ·  @CNBCTV18News
+@CNBCTV18Live
+Marico Q4: Revenue ₹3,325 Cr, EBITDA ₹527 Cr, margin 15.8% vs poll
+🏷 MARICO
 
-2. Tata Tech Q4 beats estimates; revenue up 12% YoY
-    @ETNOWlive
+@REDBOXINDIA
+POWER TARIFFS LIKELY TO RISE AS REGULATORS ACT ON SC ORDER - FE
 
-3. CDSL reports 40% jump in demat account additions in April
-    🏷 CDSL  ·  @NDTVProfitIndia
+@CNBCTV18News
+L&T wins ₹2,500–5,000 Cr order from NTPC
+🏷 LT  ·  BHARATCOAL  ·  COALINDIA
 
 ─────────────────────────
 🔄 3 new updates  ·  `a3f8b1c2`
 ```
+
+REDBOXINDIA updates are included as-is (raw headline if the LLM summary is unavailable). All other accounts show the LLM-generated one-sentence summary.
 
 ---
 

@@ -27,44 +27,45 @@ def _load_seen_ids() -> set:
 def _save_seen_ids(seen: set) -> None:
     try:
         _SEEN_IDS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ids = list(seen)[-_MAX_SEEN_IDS:]
-        _SEEN_IDS_FILE.write_text(json.dumps(ids, ensure_ascii=False), encoding="utf-8")
+        _SEEN_IDS_FILE.write_text(
+            json.dumps(list(seen)[-_MAX_SEEN_IDS:], ensure_ascii=False),
+            encoding="utf-8",
+        )
     except Exception as e:
         log("SEEN_IDS", f"Save failed: {e}")
 
 
 # ── Telegram formatting ───────────────────────────────────────────────────────
 
-def _format_digest(summaries: list, run_id: str, msg_num: int, total_new: int) -> str:
-    now = datetime.now(timezone.utc)
-    date_str = now.strftime("%d %b %Y")
-    time_str = now.strftime("%H:%M UTC")
+def _display_text(item: dict) -> str:
+    """Best available text for a summary item — summary first, raw headline fallback."""
+    summary = item.get("summary", "").strip()
+    if summary and summary not in ("No market update.", "Summary unavailable.", ""):
+        return summary
+    # For REDBOXINDIA (and any other bypass case), show the clean headline directly
+    return item.get("clean_text", "") or item.get("raw_text", "") or "—"
 
+
+def _format_message(items: list, run_id: str, total_new: int) -> str:
+    now = datetime.now(timezone.utc)
     lines = [
-        f"📊 *Market Flash*  ·  {date_str}  ·  {time_str}",
+        f"📊 *Market Flash*  ·  {now.strftime('%d %b %Y')}  ·  {now.strftime('%H:%M UTC')}",
         "",
     ]
 
-    for i, item in enumerate(summaries, start=1 + (msg_num - 1) * _PER_MESSAGE):
-        summary = item.get("summary", "").strip()
-        if not summary or summary in ("No market update.", "Summary unavailable."):
-            continue
-
+    for item in items:
+        text = _display_text(item)
         author = item.get("author", "")
         stocks = item.get("stock_tags", [])
 
-        lines.append(f"*{i}.* {summary}")
-
-        meta_parts = []
+        lines.append(f"*@{author}*")
+        lines.append(text)
         if stocks:
-            meta_parts.append("🏷 " + "  ".join(stocks))
-        meta_parts.append(f"@{author}")
-        lines.append("    " + "  ·  ".join(meta_parts))
+            lines.append("🏷 " + "  ·  ".join(stocks))
         lines.append("")
 
-    lines.append(f"─────────────────────────")
+    lines.append("─────────────────────────")
     lines.append(f"🔄 {total_new} new update{'s' if total_new != 1 else ''}  ·  `{run_id}`")
-
     return "\n".join(lines)
 
 
@@ -116,7 +117,7 @@ def _save_run(state: dict, alerts_sent: int, errors: list, new_count: int) -> No
             json.dumps(runs[:_MAX_STORED_RUNS], indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        log("OUTPUT", f"Saved {len(_build_tweet_records(state))} tweet records  ({new_count} new)")
+        log("OUTPUT", f"Saved {len(_build_tweet_records(state))} records  ({new_count} new)")
     except Exception as e:
         log("OUTPUT", f"Save failed: {e}")
 
@@ -127,14 +128,21 @@ def twitter_telegram_node(state: dict) -> dict:
     all_summaries = state.get("summaries", [])
     run_id = state.get("run_id", "?")
 
-    # Filter to only tweets not previously sent
+    # Cross-run dedup: drop tweets already sent in a previous run
     seen_ids = _load_seen_ids()
     new_summaries = [s for s in all_summaries if s.get("tweet_id") not in seen_ids]
-    # Drop "No market update" entries before sending
-    sendable = [s for s in new_summaries if s.get("summary", "").strip()
-                not in ("", "No market update.", "Summary unavailable.")]
 
-    log("TELEGRAM", f"{len(all_summaries)} summaries total — {len(sendable)} new to send")
+    # Sendable filter:
+    #   REDBOXINDIA → always send (every update, no exception)
+    #   Others      → only if summary has real content
+    sendable = []
+    for s in new_summaries:
+        is_redbox = s.get("author", "").upper() == "REDBOXINDIA"
+        has_content = _display_text(s) not in ("", "—")
+        if is_redbox or has_content:
+            sendable.append(s)
+
+    log("TELEGRAM", f"{len(all_summaries)} total — {len(new_summaries)} new — {len(sendable)} to send")
 
     sent = 0
     errors = []
@@ -151,18 +159,17 @@ def twitter_telegram_node(state: dict) -> dict:
             break
 
         chunk = sendable[chunk_start: chunk_start + _PER_MESSAGE]
-        message = _format_digest(chunk, run_id, sent + 1, len(sendable))
+        message = _format_message(chunk, run_id, len(sendable))
 
         try:
             send_telegram_message(message)
             sent += 1
-            # Mark these IDs as seen only after successful send
             for item in chunk:
                 seen_ids.add(item.get("tweet_id", ""))
-            log("TELEGRAM", f"Sent digest {sent} ({len(chunk)} updates)")
+            log("TELEGRAM", f"Sent message {sent} ({len(chunk)} updates)")
         except Exception as e:
             errors.append(str(e))
-            log("TELEGRAM", f"Failed digest {sent + 1}: {e}")
+            log("TELEGRAM", f"Failed message {sent + 1}: {e}")
 
     _save_seen_ids(seen_ids)
     state["alerts_sent"] = sent
