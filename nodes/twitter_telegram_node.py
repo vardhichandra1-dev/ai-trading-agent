@@ -5,8 +5,6 @@ from pathlib import Path
 from services.telegram_service import send_telegram_message
 from utils.logger import log
 
-_PER_MESSAGE = 5
-_MAX_MESSAGES = 4
 _OUTPUT_FILE = Path("data/twitter_output.json")
 _SEEN_IDS_FILE = Path("data/seen_tweet_ids.json")
 _MAX_STORED_RUNS = 500
@@ -37,69 +35,46 @@ def _save_seen_ids(seen: set) -> None:
 
 # ── Telegram formatting ───────────────────────────────────────────────────────
 
-def _display_text(item: dict) -> str:
-    """Best available text for a summary item — summary first, raw headline fallback."""
-    summary = item.get("summary", "").strip()
-    if summary and summary not in ("No market update.", "Summary unavailable.", ""):
-        return summary
-    # For REDBOXINDIA (and any other bypass case), show the clean headline directly
-    return item.get("clean_text", "") or item.get("raw_text", "") or "—"
+def _format_tweet(tweet: dict) -> str:
+    text = tweet.get("raw_text", "").strip() or tweet.get("clean_text", "").strip() or "—"
 
+    # Parse timestamp for display
+    ts_raw = tweet.get("created_at", "")
+    try:
+        dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        time_str = dt.strftime("%H:%M UTC  ·  %d %b %Y")
+    except Exception:
+        time_str = datetime.now(timezone.utc).strftime("%H:%M UTC  ·  %d %b %Y")
 
-def _format_message(items: list, run_id: str, total_new: int) -> str:
-    now = datetime.now(timezone.utc)
-    lines = [
-        f"📊 *Market Flash*  ·  {now.strftime('%d %b %Y')}  ·  {now.strftime('%H:%M UTC')}",
-        "",
-    ]
-
-    for item in items:
-        text = _display_text(item)
-        author = item.get("author", "")
-        stocks = item.get("stock_tags", [])
-
-        lines.append(f"*@{author}*")
-        lines.append(text)
-        if stocks:
-            lines.append("🏷 " + "  ·  ".join(stocks))
-        lines.append("")
-
-    lines.append("─────────────────────────")
-    lines.append(f"🔄 {total_new} new update{'s' if total_new != 1 else ''}  ·  `{run_id}`")
-    return "\n".join(lines)
+    return f"🔴 *REDBOXINDIA*\n\n{text}\n\n🕐 {time_str}"
 
 
 # ── Output persistence ────────────────────────────────────────────────────────
 
-def _build_tweet_records(state: dict) -> list:
-    return [
-        {
-            "tweet_id": t.get("tweet_id", ""),
-            "author": t.get("author", ""),
-            "raw_text": t.get("raw_text", ""),
-            "clean_text": t.get("clean_text", ""),
-            "summary": t.get("summary", ""),
-            "created_at": t.get("created_at", ""),
-            "stock_tags": t.get("stock_tags", []),
-            "source": t.get("source", ""),
-        }
-        for t in state.get("deduplicated_tweets", [])
-    ]
-
-
 def _save_run(state: dict, alerts_sent: int, errors: list, new_count: int) -> None:
+    tweets = state.get("deduplicated_tweets", [])
     record = {
         "run_id": state.get("run_id", "?"),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "pipeline_stats": {
             "raw_tweets": len(state.get("raw_tweets", [])),
             "filtered_tweets": len(state.get("filtered_tweets", [])),
-            "deduplicated_tweets": len(state.get("deduplicated_tweets", [])),
+            "deduplicated_tweets": len(tweets),
             "new_tweets": new_count,
-            "summaries": len(state.get("summaries", [])),
             "alerts_sent": alerts_sent,
         },
-        "tweets": _build_tweet_records(state),
+        "tweets": [
+            {
+                "tweet_id": t.get("tweet_id", ""),
+                "author": t.get("author", ""),
+                "raw_text": t.get("raw_text", ""),
+                "clean_text": t.get("clean_text", ""),
+                "created_at": t.get("created_at", ""),
+                "stock_tags": t.get("stock_tags", []),
+                "source": t.get("source", ""),
+            }
+            for t in tweets
+        ],
         "fetch_debug": state.get("fetch_debug", []),
         "telegram_errors": errors,
     }
@@ -117,7 +92,7 @@ def _save_run(state: dict, alerts_sent: int, errors: list, new_count: int) -> No
             json.dumps(runs[:_MAX_STORED_RUNS], indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        log("OUTPUT", f"Saved {len(_build_tweet_records(state))} records  ({new_count} new)")
+        log("OUTPUT", f"Saved {len(tweets)} records  ({new_count} new)")
     except Exception as e:
         log("OUTPUT", f"Save failed: {e}")
 
@@ -125,57 +100,39 @@ def _save_run(state: dict, alerts_sent: int, errors: list, new_count: int) -> No
 # ── Node ──────────────────────────────────────────────────────────────────────
 
 def twitter_telegram_node(state: dict) -> dict:
-    all_summaries = state.get("summaries", [])
-    run_id = state.get("run_id", "?")
+    all_tweets = state.get("deduplicated_tweets", [])
 
     # Cross-run dedup: drop tweets already sent in a previous run
     seen_ids = _load_seen_ids()
-    new_summaries = [s for s in all_summaries if s.get("tweet_id") not in seen_ids]
+    new_tweets = [t for t in all_tweets if t.get("tweet_id") not in seen_ids]
 
-    # Sendable filter:
-    #   REDBOXINDIA → always send (every update, no exception)
-    #   Others      → only if summary has real content
-    sendable = []
-    for s in new_summaries:
-        is_redbox = s.get("author", "").upper() == "REDBOXINDIA"
-        has_content = _display_text(s) not in ("", "—")
-        if is_redbox or has_content:
-            sendable.append(s)
+    # Sort oldest → newest so Telegram feed reads as a timeline
+    new_tweets.sort(key=lambda t: t.get("created_at", ""))
 
-    # Sort by tweet timestamp (oldest first) so Telegram messages read chronologically
-    sendable.sort(key=lambda s: s.get("timestamp", ""))
-
-    log("TELEGRAM", f"{len(all_summaries)} total — {len(new_summaries)} new — {len(sendable)} to send")
+    log("TELEGRAM", f"{len(all_tweets)} total — {len(new_tweets)} new to send")
 
     sent = 0
     errors = []
 
-    if not sendable:
+    if not new_tweets:
         state["alerts_sent"] = 0
         state["telegram_errors"] = []
         _save_run(state, 0, [], 0)
         return state
 
-    for chunk_start in range(0, len(sendable), _PER_MESSAGE):
-        if sent >= _MAX_MESSAGES:
-            log("TELEGRAM", f"Reached message cap ({_MAX_MESSAGES}), stopping")
-            break
-
-        chunk = sendable[chunk_start: chunk_start + _PER_MESSAGE]
-        message = _format_message(chunk, run_id, len(sendable))
-
+    for tweet in new_tweets:
+        message = _format_tweet(tweet)
         try:
             send_telegram_message(message)
+            seen_ids.add(tweet.get("tweet_id", ""))
             sent += 1
-            for item in chunk:
-                seen_ids.add(item.get("tweet_id", ""))
-            log("TELEGRAM", f"Sent message {sent} ({len(chunk)} updates)")
+            log("TELEGRAM", f"Sent tweet {sent}/{len(new_tweets)}: {tweet.get('raw_text', '')[:60]}")
         except Exception as e:
             errors.append(str(e))
-            log("TELEGRAM", f"Failed message {sent + 1}: {e}")
+            log("TELEGRAM", f"Failed tweet {sent + 1}: {e}")
 
     _save_seen_ids(seen_ids)
     state["alerts_sent"] = sent
     state["telegram_errors"] = errors
-    _save_run(state, sent, errors, len(sendable))
+    _save_run(state, sent, errors, len(new_tweets))
     return state

@@ -20,7 +20,6 @@ def _initial_state() -> dict:
         "raw_tweets": [],
         "filtered_tweets": [],
         "deduplicated_tweets": [],
-        "summaries": [],
         "fetch_debug": [],
         "alerts_sent": 0,
         "telegram_errors": [],
@@ -31,22 +30,21 @@ def _initial_state() -> dict:
 
 
 def _print_summary(state: dict) -> None:
-    summaries = state.get("summaries", [])
+    tweets = state.get("deduplicated_tweets", [])
     print()
     print("=" * 64)
     print(f"Run: {state.get('run_id')}  |  {datetime.now().strftime('%H:%M:%S')}")
     print(f"  Raw tweets    : {len(state.get('raw_tweets', []))}")
     print(f"  After filter  : {len(state.get('filtered_tweets', []))}")
-    print(f"  After dedup   : {len(state.get('deduplicated_tweets', []))}")
-    print(f"  Summaries     : {len(summaries)}")
-    print(f"  Telegram sent : {state.get('alerts_sent', 0)} message(s)")
-    if summaries:
+    print(f"  After dedup   : {len(tweets)}")
+    print(f"  Telegram sent : {state.get('alerts_sent', 0)} tweet(s)")
+    if tweets:
         print()
         print("  Latest updates:")
-        for s in summaries[:5]:
-            stocks = ", ".join(s.get("stock_tags", [])) or "—"
-            print(f"    [{s['author']}] {stocks}")
-            print(f"      {s['summary']}")
+        for t in tweets[:5]:
+            stocks = ", ".join(t.get("stock_tags", [])) or "—"
+            print(f"    [{t['author']}] {stocks}")
+            print(f"      {t.get('raw_text', '')[:80]}")
     if state.get("telegram_errors"):
         print()
         print(f"  Telegram errors: {state['telegram_errors']}")
@@ -55,7 +53,7 @@ def _print_summary(state: dict) -> None:
 
 
 def run_once(graph) -> dict:
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Twitter summarisation run...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting REDBOXINDIA feed run...")
     state = _initial_state()
     try:
         result = graph.invoke(state)
@@ -83,7 +81,7 @@ def main(once: bool = False) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Twitter stock news summarisation agent.")
+    p = argparse.ArgumentParser(description="REDBOXINDIA feed agent.")
     p.add_argument("--once", action="store_true", help="Run one cycle and exit.")
     return p.parse_args()
 

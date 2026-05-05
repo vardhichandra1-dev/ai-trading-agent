@@ -5,7 +5,7 @@ Two parallel data-ingestion pipelines run simultaneously inside a single LangGra
 | Pipeline | Data source | Telegram output |
 |----------|-------------|-----------------|
 | **NSE Announcements** | NSE corporate announcements API + PDF attachments | BUY / SELL / NEUTRAL trading signal with full reasoning |
-| **Twitter / X News** | CNBCTV18Live · NDTVProfitIndia · ETNOWlive · REDBOXINDIA | Plain-English news digests — new tweets only, no duplicates |
+| **REDBOXINDIA Feed** | REDBOXINDIA on X (via Playwright + Nitter) | Each tweet sent individually, in chronological order |
 
 ---
 
@@ -40,14 +40,14 @@ python run.py --once
 flowchart TD
     A([run.py — start cycle]) --> B[refresh\nFetch latest NSE announcements\nUpdate nse_master.json]
 
-    B --> C[nse\nNSE announcements pipeline]
-    B --> D[twitter\nTwitter summarisation pipeline]
+    B --> C[nse\nNSE announcements pipeline\norder filter → PDF → signal → validate]
+    B --> D[twitter\nREDBOXINDIA feed pipeline\nscrape → dedup → detect → telegram]
 
     C -->|BUY / SELL / NEUTRAL signal| E[(ai_research_output.json)]
     C -->|If notify=true| F([Telegram — NSE Alert])
 
-    D -->|New summaries digest| G[(twitter_output.json)]
-    D -->|Up to 4 digest messages| H([Telegram — News Digest])
+    D -->|New tweet feed| G[(twitter_output.json)]
+    D -->|One message per tweet| H([Telegram — REDBOXINDIA Feed])
 
     E --> I([combined_runs.json])
     G --> I
@@ -64,13 +64,17 @@ Both `nse` and `twitter` nodes execute **in parallel** — LangGraph threads the
 
 ## Pipeline 1 — NSE Announcements Agent
 
-Processes one NSE corporate announcement per cycle, downloads its PDF disclosure, generates a Groq-backed trading signal, optionally validates with Tavily web search, and sends a Telegram alert for fresh actionable signals.
+Processes one NSE corporate announcement per cycle. A rule-based pre-filter runs first — only **revenue-generating order/contract wins and acquisition/M&A events** proceed to the full LLM pipeline. Legal/regulatory noise is discarded without spending any Groq or Tavily credits.
 
 ### LangGraph
 
 ```mermaid
 flowchart TD
-    A([Start]) --> B[pdf_node\nDownload PDF attachment]
+    A([Start]) --> OF[order_filter_node\nScore SUBJECT + DETAILS\nDetector 1: Order/contract win\nDetector 2: Acquisition / M&A\nPass if either scores ≥ 0.7]
+
+    OF --> |REJECT score < 0.7| I[report_node\nstatus=FILTERED]
+    OF --> |PASS score ≥ 0.7| B[pdf_node\nDownload PDF attachment]
+
     B --> C[pdf_summary_node\nExtract text page-by-page]
 
     C --> D{PDF size}
@@ -81,7 +85,7 @@ flowchart TD
     F --> G
 
     G --> H{Signal}
-    H -- NEUTRAL --> I[report_node]
+    H -- NEUTRAL --> I
     H -- "BUY / SELL" --> J[validation_node\nGenerate queries via Groq\nTavily web search 3–5 queries]
 
     J --> K{Search results?}
@@ -100,8 +104,49 @@ flowchart TD
     Q --> R[(ai_research_output.json)]
 ```
 
+### Pre-filter — scoring engine
+
+The filter runs on `SUBJECT + DETAILS` text before any API call is made. Two detectors run in parallel — a record passes if **either** scores ≥ 0.7; the higher-scoring result is used.
+
+#### Detector 1 — Order / contract win
+
+| Signal | Keywords / patterns | Weight |
+|--------|---------------------|--------|
+| Primary | "secured order", "bagged contract", "letter of award", "epc order", regex patterns | +0.5 |
+| Business context | project, supply, execution, client, solar, power, railway… | +0.2 |
+| Monetary value | crore, million, lakh, worth, ₹… | +0.2 |
+| No negative keywords | — | +0.1 |
+
+**Hard reject** on any order-negative keyword: `order-in-appeal`, `court order`, `gst order`, `penalty order`, `show cause`, `stay order`, `injunction`, etc.
+
+#### Detector 2 — Acquisition / M&A
+
+| Signal | Keywords / patterns | Weight |
+|--------|---------------------|--------|
+| Primary | acquisition, acquire, buyout, takeover, merger, amalgamation, stake acquisition, equity stake… | +0.6 |
+| Supporting context | subsidiary, target company, deal value, board approval, definitive agreement… | +0.3 |
+| No negative keywords | — | +0.1 |
+
+**Hard reject** on acquisition-negative keywords: `denies`, `rumor`, `no acquisition`, `withdrawn`, `clarification`, `media report`.
+
+#### Merge logic
+
+```
+order_result  = _score_order(text)     # max 1.0
+acq_result    = _score_acquisition(text)  # max 1.0
+
+passing = [r for r in (order_result, acq_result) if r.score >= 0.7]
+winner  = max(passing, key=score)  # highest score wins
+status  = PASS if passing else REJECT
+```
+
+`event_type` in the output is `"order_win"` or `"acquisition"` depending on which detector passed.
+
+**Pass threshold**: score ≥ 0.7 → full pipeline. Below threshold → `status = FILTERED`, no Groq/Tavily calls, no Telegram.
+
 ### Signal decision logic
 
+- **FILTERED** — rejected by order filter; skips PDF download and all LLM calls; not sent to Telegram.
 - **BUY / SELL** — proceeds to Tavily validation. If no search results are found, or the LLM determines the event was already public (`already_reflected = true`), `notify` is set to `false` and no Telegram alert is sent.
 - **NEUTRAL** — skips Tavily entirely; no Telegram alert.
 - Telegram is only triggered when: signal is BUY or SELL **and** `notify = true`.
@@ -125,23 +170,22 @@ Scanned / image pages (< 30 characters) are detected and skipped. `PDF_MAX_PAGES
 
 ---
 
-## Pipeline 2 — Twitter News Summarisation Agent
+## Pipeline 2 — REDBOXINDIA Feed Agent
 
-Scrapes tweets from four high-credibility Indian financial accounts using Playwright, filters noise, deduplicates within each run, tags detected NSE stocks, summarises each update via Groq, and sends only **new** (previously unsent) tweet summaries to Telegram.
+Scrapes tweets from **REDBOXINDIA** using Playwright, deduplicates within and across runs, tags detected NSE stocks, and sends each new tweet as an individual Telegram message in chronological order.
 
-**No trading signals are generated from Twitter data.**
+**No LLM summarisation. No filtering. Every tweet goes directly to Telegram.**
 
 ### LangGraph
 
 ```mermaid
 flowchart LR
-    A([Start]) --> B[tweet_collector_node\nPlaywright → Nitter instances\n4 accounts × 20 tweets]
-    B --> C[noise_filter_node\nStrip URLs · emojis · whitespace\nReject ads / politics / sports\nKeep financial signal keywords]
+    A([Start]) --> B[tweet_collector_node\nPlaywright → Nitter instances\nREDBOXINDIA × 20 tweets]
+    B --> C[noise_filter_node\nStrip URLs · emojis · whitespace]
     C --> D[dedup_node\nTF-IDF cosine similarity\nthreshold 0.85\nfirst-seen order wins]
     D --> E[stock_detector_node\nReload NSE master each run\nTag each tweet with detected NSE symbols]
-    E --> F[tweet_summarizer_node\nBatch 10 tweets per Groq call\nOne sentence per tweet]
-    F --> G[twitter_telegram_node\nFilter already-seen IDs\nSort chronologically oldest→newest\n5 summaries per message · max 4 messages\nUpdate seen_tweet_ids.json\nSave to twitter_output.json]
-    G --> H([Telegram])
+    E --> F[twitter_telegram_node\nFilter already-seen IDs\nSort chronologically oldest→newest\nOne message per tweet\nUpdate seen_tweet_ids.json\nSave to twitter_output.json]
+    F --> G([Telegram])
 ```
 
 ### Scraping strategy
@@ -164,43 +208,22 @@ nitter.kavin.rocks → nitter.cz → nitter.it → x.com (last resort)
 
 | Layer | Scope | Method |
 |-------|-------|--------|
-| Within-run | Same pipeline cycle | TF-IDF cosine similarity ≥ 0.85; first-seen order wins (no account weighting) |
+| Within-run | Same pipeline cycle | TF-IDF cosine similarity ≥ 0.85; first-seen order wins |
 | Cross-run | Across all previous runs | Content-stable `tweet_id` (MD5 of normalised text + author) checked against `data/seen_tweet_ids.json` |
 
 `tweet_id` is derived from normalised tweet content — not timestamps — so it stays stable even if Playwright renders the page slightly differently each run. IDs are recorded only after a Telegram message sends successfully.
 
-### Target accounts
+### Telegram message format
 
-| Account | Filter rule |
-|---------|-------------|
-| CNBCTV18Live | Stock-market keyword filter |
-| ETNOWlive | Stock-market keyword filter |
-| NDTVProfitIndia | Stock-market keyword filter |
-| REDBOXINDIA | **No filter — every tweet reaches Telegram** |
-
-### Telegram digest format
-
-Messages are sent in chronological order (oldest tweet first) so the digest reads like a timeline.
+Each tweet is sent as a **separate Telegram message**, in chronological order (oldest first).
 
 ```
-📊 Market Flash  ·  04 May 2026  ·  11:13 UTC
+🔴 REDBOXINDIA
 
-@REDBOXINDIA
 POWER TARIFFS LIKELY TO RISE AS REGULATORS ACT ON SC ORDER - FE
 
-@CNBCTV18Live
-Marico Q4: Revenue ₹3,325 Cr, EBITDA ₹527 Cr, margin 15.8% vs poll
-🏷 MARICO
-
-@ETNOWlive
-L&T wins ₹2,500–5,000 Cr order from NTPC
-🏷 LT  ·  COALINDIA
-
-─────────────────────────
-🔄 3 new updates  ·  `a3f8b1c2`
+🕐 11:13 UTC  ·  04 May 2026
 ```
-
-REDBOXINDIA updates are included as-is (raw headline if the LLM summary is unavailable). All other accounts show the LLM-generated one-sentence summary.
 
 ---
 
@@ -228,28 +251,26 @@ One entry per Twitter pipeline run. Newest first, capped at 500 runs.
     "run_id": "a3f8b1c2",
     "timestamp": "2026-05-04T11:13:19+00:00",
     "pipeline_stats": {
-      "raw_tweets": 76,
-      "filtered_tweets": 61,
-      "deduplicated_tweets": 61,
-      "new_tweets": 12,
-      "summaries": 61,
-      "alerts_sent": 3
+      "raw_tweets": 20,
+      "filtered_tweets": 20,
+      "deduplicated_tweets": 18,
+      "new_tweets": 5,
+      "alerts_sent": 5
     },
     "tweets": [
       {
         "tweet_id": "3f8b1c2a4d6e",
-        "author": "CNBCTV18News",
-        "raw_text": "L&T wins ₹2,500–5,000 Cr order...",
-        "clean_text": "L&T wins 2500 5000 Cr order...",
-        "summary": "Larsen & Toubro wins ₹2,500–5,000 Cr infra order from NTPC.",
+        "author": "REDBOXINDIA",
+        "raw_text": "POWER TARIFFS LIKELY TO RISE AS REGULATORS ACT ON SC ORDER - FE",
+        "clean_text": "POWER TARIFFS LIKELY TO RISE AS REGULATORS ACT ON SC ORDER - FE",
         "created_at": "2026-05-04T09:10:00+00:00",
-        "stock_tags": ["LT", "BHARATCOAL"],
+        "stock_tags": ["NTPC", "TATAPOWER"],
         "source": "playwright+nitter:nitter.tiekoetter.com"
       }
     ],
     "fetch_debug": [
       {
-        "account": "CNBCTV18News",
+        "account": "REDBOXINDIA",
         "status": "SUCCESS",
         "tweets_fetched": 20,
         "error": "",
@@ -274,7 +295,7 @@ One entry per combined `run.py` cycle. Newest first, capped at 500 runs.
 Create `.env` in the project root:
 
 ```env
-# ── Groq LLM (both pipelines) ────────────────────────────────────────────────
+# ── Groq LLM (NSE pipeline only) ─────────────────────────────────────────────
 GROQ_API_KEY=
 GROQ_MODEL=openai/gpt-oss-120b
 GROQ_BACKUP_MODEL_1=llama-3.3-70b-versatile
@@ -283,7 +304,7 @@ GROQ_TIMEOUT_SECONDS=90
 GROQ_QUERY_TIMEOUT_SECONDS=90
 GROQ_VALIDATION_TIMEOUT_SECONDS=120
 
-# ── Telegram (both pipelines) ─────────────────────────────────────────────────
+# ── Telegram (NSE + REDBOXINDIA pipelines) ────────────────────────────────────
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 
@@ -300,8 +321,8 @@ PDF_SUMMARY_NUM_PREDICT=384
 PDF_SUMMARY_FINAL_NUM_PREDICT=700
 PDF_SUMMARY_BATCH_SIZE=6
 
-# ── Twitter pipeline ──────────────────────────────────────────────────────────
-# Number of tweets to fetch per account per run (default 20)
+# ── REDBOXINDIA pipeline ─────────────────────────────────────────────────────
+# Number of tweets to fetch per run (default 20)
 TWEETS_PER_ACCOUNT=20
 ```
 
@@ -317,23 +338,24 @@ ai_research_agent/
 │  ── Entry points ──────────────────────────────────────────────────────
 ├── run.py                           # ★ PRIMARY — both pipelines in parallel
 ├── main.py                          # NSE pipeline standalone
-├── twitter_main.py                  # Twitter pipeline standalone
+├── twitter_main.py                  # REDBOXINDIA pipeline standalone
 │
 │  ── Combined graph ────────────────────────────────────────────────────
 ├── combined_graph.py                # refresh → [nse ‖ twitter] → END
 ├── combined_state.py                # CombinedState TypedDict
 │
 │  ── NSE pipeline ───────────────────────────────────────────────────────
-├── graph.py                         # NSE LangGraph (6 nodes)
+├── graph.py                         # NSE LangGraph (7 nodes)
 ├── state.py                         # GraphState TypedDict
 ├── nse_fetcher.py                   # NSE API fetcher + nse_master.json writer
 │
-│  ── Twitter pipeline ──────────────────────────────────────────────────
-├── twitter_graph.py                 # Twitter LangGraph (6 nodes)
+│  ── REDBOXINDIA pipeline ──────────────────────────────────────────────
+├── twitter_graph.py                 # REDBOXINDIA LangGraph (5 nodes)
 ├── twitter_state.py                 # TwitterState TypedDict
 │
 ├── nodes/
 │   │  NSE nodes
+│   ├── order_filter_node.py         # Score SUBJECT+DETAILS; gate LLM pipeline
 │   ├── pdf_node.py                  # Download PDF attachment
 │   ├── pdf_summary_node.py          # Chunk-summarise large PDFs; cache results
 │   ├── signal_node.py               # Generate BUY / SELL / NEUTRAL via Groq
@@ -341,19 +363,19 @@ ai_research_agent/
 │   ├── report_node.py               # Format final report string
 │   ├── telegram_node.py             # Send Telegram alert when notify=true
 │   │
-│   │  Twitter nodes
+│   │  Twitter / REDBOXINDIA nodes
 │   ├── tweet_collector_node.py      # Fetch tweets via Playwright+Nitter
-│   ├── noise_filter_node.py         # Clean text; keep only financial keywords
+│   ├── noise_filter_node.py         # Strip URLs, emojis, whitespace
 │   ├── dedup_node.py                # TF-IDF cosine deduplication (within-run)
 │   ├── stock_detector_node.py       # Reload NSE master; tag tweets with NSE symbols
-│   ├── tweet_summarizer_node.py     # Batch Groq summarisation (10 tweets/call)
-│   └── twitter_telegram_node.py     # Filter seen IDs; sort chronologically; send digests; write output
+│   └── twitter_telegram_node.py     # Filter seen IDs; sort chronologically; send one message per tweet; write output
 │
 ├── services/
 │   ├── llm_service.py               # Groq API — primary + 2 backup models
 │   ├── telegram_service.py          # Telegram Bot API
 │   ├── pdf_service.py               # PDF download + page-by-page extraction
 │   ├── tavily_service.py            # Tavily web search
+│   ├── order_filter_service.py      # Dual detector: order/contract win + acquisition/M&A scoring
 │   ├── twitter_scraper_service.py   # Playwright+Nitter scraper (no login needed)
 │   ├── stock_detector_service.py    # NSE symbol lookup + 50+ company aliases
 │   └── dedup_service.py             # Pure-Python TF-IDF cosine similarity

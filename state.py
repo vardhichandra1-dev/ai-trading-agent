@@ -7,6 +7,8 @@ class GraphState(TypedDict):
     symbol: str
     records: List[Dict]
 
+    order_filter: Dict  # result from order_filter_service.filter_order()
+
     pdf_text: str
     pdf_summary: str
     queries: List[str]

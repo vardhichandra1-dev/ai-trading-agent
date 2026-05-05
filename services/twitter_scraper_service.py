@@ -5,9 +5,6 @@ from datetime import datetime, timezone
 from typing import List, Tuple
 
 TARGET_ACCOUNTS = [
-    "CNBCTV18Live",
-    "NDTVProfitIndia",
-    "ETNOWlive",
     "REDBOXINDIA",
 ]
 DEFAULT_TWEETS_PER_ACCOUNT = 20

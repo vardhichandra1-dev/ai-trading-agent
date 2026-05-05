@@ -3,16 +3,19 @@ def report_node(state):
     if not status or status == "PENDING":
         status = "SUCCESS"
 
+    signal = state.get("signal") or state.get("recommendation") or "NEUTRAL"
+    analysis = state.get("analysis") or state.get("recommendation_reason") or ""
+
     state["report"] = f"""
 SYMBOL: {state['symbol']}
 STATUS: {status}
-SIGNAL: {state.get('signal') or state.get('recommendation') or 'NEUTRAL'}
+SIGNAL: {signal}
 CONFIDENCE: {state.get('confidence') or 'Low'}
 ALREADY_REFLECTED: {state.get('already_reflected', False)}
 NOTIFY: {state.get('notify', False)}
 PDF_SUMMARY_CHARS: {len(state.get('pdf_summary', ''))}
 
-{state['analysis']}
+{analysis}
 """.strip()
 
     state["status"] = status

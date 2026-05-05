@@ -60,6 +60,7 @@ def initial_state(record):
     return {
         "symbol": record.get("SYMBOL", ""),
         "records": [record],
+        "order_filter": {},
         "pdf_text": "",
         "pdf_summary": "",
         "queries": [],
@@ -87,6 +88,7 @@ def failed_state(record, error):
     return {
         "symbol": symbol,
         "records": [record],
+        "order_filter": {},
         "pdf_text": "",
         "pdf_summary": "",
         "queries": [],
