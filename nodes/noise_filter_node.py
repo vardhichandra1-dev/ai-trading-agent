@@ -9,6 +9,13 @@ _SIGNAL_KEYWORDS = frozenset({
     "upgrade", "downgrade", "target", "guidance", "forecast", "investment",
     "raise", "fund", "ipo", "listing", "shares", "stock", "nse", "bse",
     "sensex", "nifty", "q1", "q2", "q3", "q4",
+    # Regulatory / macro financial
+    "tariff", "tariffs", "regulator", "regulators", "regulation", "sebi",
+    "rbi", "irdai", "trai", "cerc", "penalty", "fine", "compliance",
+    "policy", "rate", "hike", "cut", "inflation", "gdp", "fiscal",
+    # Sector keywords (energy, infra, banking)
+    "power", "electricity", "energy", "coal", "oil", "gas", "refinery",
+    "telecom", "pharma", "bank", "insurance", "realty", "steel", "cement",
     # Major company names as bare keywords
     "reliance", "infosys", "wipro", "hdfc", "icici", "sbi", "bajaj",
     "maruti", "airtel", "adani", "tatasteel", "tatamotors", "hcltech",
@@ -51,13 +58,14 @@ def noise_filter_node(state: dict) -> dict:
     filtered = []
 
     for tweet in raw:
-        clean = _clean(tweet.get("text", ""))
+        clean = _clean(tweet.get("raw_text", ""))
         if _is_relevant(clean):
             filtered.append({
-                "id": tweet["id"],
+                "tweet_id": tweet["tweet_id"],
+                "raw_text": tweet["raw_text"],
                 "clean_text": clean,
                 "author": tweet["author"],
-                "timestamp": tweet["timestamp"],
+                "created_at": tweet["created_at"],
                 "account_weight": tweet.get("account_weight", 0.70),
             })
 

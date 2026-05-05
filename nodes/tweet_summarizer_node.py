@@ -37,7 +37,6 @@ def _parse(response: str, count: int) -> List[str]:
                 result[idx] = str(item.get("summary", "")).strip()
         return result
     except Exception:
-        # fallback: return the raw response trimmed for every slot
         snippet = response.strip()[:120]
         return [snippet] * count
 
@@ -63,13 +62,16 @@ def tweet_summarizer_node(state: dict) -> dict:
             batch_summaries = ["Summary unavailable."] * len(batch)
 
         for tweet, summary in zip(batch, batch_summaries):
+            # Embed summary directly into tweet dict for unified output record
+            tweet["summary"] = summary if summary else "Summary unavailable."
+
             if summary and summary != "No market update.":
                 summaries.append({
                     "author": tweet["author"],
                     "stock_tags": tweet.get("stock_tags", []),
                     "summary": summary,
-                    "timestamp": tweet["timestamp"],
-                    "tweet_id": tweet["id"],
+                    "timestamp": tweet["created_at"],
+                    "tweet_id": tweet["tweet_id"],
                 })
 
     state["summaries"] = summaries

@@ -5,10 +5,9 @@ class TwitterState(TypedDict):
     run_id: str
     raw_tweets: List[Dict]
     filtered_tweets: List[Dict]
-    # each tweet has stock_tags: List[str] added by stock_detector_node
     deduplicated_tweets: List[Dict]
-    # one dict per tweet: {author, stock_tags, summary, timestamp}
     summaries: List[Dict]
+    fetch_debug: List[Dict]
     alerts_sent: int
     telegram_errors: List[str]
     status: str

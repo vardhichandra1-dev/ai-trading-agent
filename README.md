@@ -5,7 +5,7 @@ Two parallel data-ingestion pipelines run simultaneously inside a single LangGra
 | Pipeline | Data source | Telegram output |
 |----------|-------------|-----------------|
 | **NSE Announcements** | NSE corporate announcements API + PDF attachments | BUY / SELL / NEUTRAL trading signal with full reasoning |
-| **Twitter / X News** | CNBCTV18News · NDTVProfitIndia · ETNOWlive · RedboxGlobal | Plain-English news digests — no trading signals |
+| **Twitter / X News** | CNBCTV18News · CNBCTV18Live · NDTVProfitIndia · ETNOWlive · REDBOXINDIA | Plain-English news digests — new tweets only, no duplicates |
 
 ---
 
@@ -14,6 +14,7 @@ Two parallel data-ingestion pipelines run simultaneously inside a single LangGra
 ```bash
 # Install dependencies
 pip install -r requirements.txt
+playwright install chromium
 
 # Copy and fill in credentials
 cp .env.example .env   # or create .env manually (see Environment section)
@@ -45,7 +46,7 @@ flowchart TD
     C -->|BUY / SELL / NEUTRAL signal| E[(ai_research_output.json)]
     C -->|If notify=true| F([Telegram — NSE Alert])
 
-    D -->|Summaries digest| G[(twitter_output.json)]
+    D -->|New summaries digest| G[(twitter_output.json)]
     D -->|Up to 4 digest messages| H([Telegram — News Digest])
 
     E --> I([combined_runs.json])
@@ -126,7 +127,7 @@ Scanned / image pages (< 30 characters) are detected and skipped. `PDF_MAX_PAGES
 
 ## Pipeline 2 — Twitter News Summarisation Agent
 
-Scrapes tweets from four high-credibility Indian financial accounts, filters noise, deduplicates, tags detected stocks, summarises each update in one sentence via Groq, and sends digest messages to Telegram.
+Scrapes tweets from four high-credibility Indian financial accounts using Playwright, filters noise, deduplicates within each run, tags detected NSE stocks, summarises each update via Groq, and sends only **new** (previously unsent) tweet summaries to Telegram.
 
 **No trading signals are generated from Twitter data.**
 
@@ -134,41 +135,66 @@ Scrapes tweets from four high-credibility Indian financial accounts, filters noi
 
 ```mermaid
 flowchart LR
-    A([Start]) --> B[tweet_collector_node\ntwscrape async\n4 accounts × 50 tweets]
+    A([Start]) --> B[tweet_collector_node\nPlaywright → Nitter instances\n4 accounts × 20 tweets]
     B --> C[noise_filter_node\nStrip URLs · emojis · whitespace\nReject ads / politics / sports\nKeep financial signal keywords]
     C --> D[dedup_node\nTF-IDF cosine similarity\nthreshold 0.85\nhigher-weight account wins]
     D --> E[stock_detector_node\nTag each tweet with\ndetected NSE symbols]
     E --> F[tweet_summarizer_node\nBatch 10 tweets per Groq call\nOne sentence per tweet]
-    F --> G[twitter_telegram_node\n5 summaries per message\nMax 4 messages per run\nSave to twitter_output.json]
+    F --> G[twitter_telegram_node\nFilter already-seen IDs\n5 summaries per message · max 4 messages\nUpdate seen_tweet_ids.json\nSave to twitter_output.json]
     G --> H([Telegram])
 ```
 
-### Deduplication logic
+### Scraping strategy
 
-When two tweets exceed 0.85 cosine similarity (TF-IDF vectors), only the one from the higher-weight account is kept. This prevents the same story appearing once per source.
+Tweets are fetched via **Playwright + Nitter** (no X account or API key required):
+
+1. Playwright launches a headless Chromium browser
+2. Navigates to each Nitter instance (tried in order until one responds)
+3. Parses `.timeline-item` elements for tweet text and timestamp
+4. Falls back to `x.com` directly only if all Nitter instances fail
+
+Nitter instances tried (in order):
+
+```
+nitter.tiekoetter.com → nitter.poast.org → nitter.1d4.us →
+nitter.kavin.rocks → nitter.cz → nitter.it → x.com (last resort)
+```
+
+### Deduplication — two layers
+
+| Layer | Scope | Method |
+|-------|-------|--------|
+| Within-run | Same pipeline cycle | TF-IDF cosine similarity ≥ 0.85; higher-weight account wins |
+| Cross-run | Across all previous runs | Exact `tweet_id` match against `data/seen_tweet_ids.json` |
+
+Only tweets whose `tweet_id` does not appear in `seen_tweet_ids.json` are sent to Telegram. IDs are recorded after each successful send.
 
 ### Target accounts
 
-| Account | Scrape weight |
-|---------|--------------|
+| Account | Weight |
+|---------|--------|
 | CNBCTV18News | 0.90 |
+| CNBCTV18Live | 0.90 |
 | ETNOWlive | 0.85 |
 | NDTVProfitIndia | 0.80 |
-| RedboxGlobal | 0.75 |
+| REDBOXINDIA | 0.75 |
 
 ### Telegram digest format
 
 ```
-📰 Market Updates  |  03 May 2026 09:15 UTC  |  run a3f8b1c2
+📊 Market Flash  ·  04 May 2026  ·  11:13 UTC
 
-• [CNBCTV18News]  RELIANCE
-  Reliance Industries announces ₹5,000 crore green energy capex for FY2027.
+1. Larsen & Toubro wins ₹2,500–5,000 Cr infra order from NTPC
+    🏷 LT  BHARATCOAL  COALINDIA  ·  @CNBCTV18News
 
-• [ETNOWlive]  TCS, INFY
-  TCS and Infosys Q4 results beat estimates; combined net profit up 9% YoY.
+2. Tata Tech Q4 beats estimates; revenue up 12% YoY
+    @ETNOWlive
 
-• [NDTVProfitIndia]  SBIN
-  SBI reports record quarterly net profit of ₹18,400 crore for Q4 FY2026.
+3. CDSL reports 40% jump in demat account additions in April
+    🏷 CDSL  ·  @NDTVProfitIndia
+
+─────────────────────────
+🔄 3 new updates  ·  `a3f8b1c2`
 ```
 
 ---
@@ -179,18 +205,6 @@ All outputs are written to `data/` and kept newest-first. Each file is capped to
 
 ### `data/nse_master.json`
 Raw NSE corporate announcements fetched from the NSE API. Refreshed at the start of every combined cycle.
-```json
-[
-  {
-    "SYMBOL": "RELIANCE",
-    "COMPANY NAME": "Reliance Industries Limited",
-    "SUBJECT": "Acquisition",
-    "DETAILS": "...",
-    "BROADCAST DATE/TIME": "2026-05-03T09:00:00",
-    "ATTACHMENT": "https://nsearchives.nseindia.com/..."
-  }
-]
-```
 
 ### `data/seen_ids.json`
 Set of NSE announcement IDs already ingested — prevents re-processing the same disclosure.
@@ -199,43 +213,42 @@ Set of NSE announcement IDs already ingested — prevents re-processing the same
 SHA-256 keyed cache of large-PDF chunk summaries. Re-processing the same PDF file skips Groq calls entirely.
 
 ### `data/ai_research_output.json`
-Full LangGraph result for every processed NSE announcement. Newest entry first, unbounded.
-```json
-[
-  {
-    "symbol": "RELIANCE",
-    "signal": "BUY",
-    "confidence": "High",
-    "analysis": "...",
-    "report": "...",
-    "notify": true,
-    "telegram_sent": true,
-    "status": "SUCCESS"
-  }
-]
-```
+Full LangGraph result for every processed NSE announcement. Newest entry first.
 
 ### `data/twitter_output.json`
-One entry per Twitter pipeline run. Newest first, capped at 500 runs. Written by `twitter_telegram_node` — captured for both standalone and combined runs.
+One entry per Twitter pipeline run. Newest first, capped at 500 runs.
 ```json
 [
   {
     "run_id": "a3f8b1c2",
-    "timestamp": "2026-05-03T09:15:42+00:00",
+    "timestamp": "2026-05-04T11:13:19+00:00",
     "pipeline_stats": {
-      "raw_tweets": 200,
-      "filtered_tweets": 45,
-      "deduplicated_tweets": 38,
-      "summaries": 12,
+      "raw_tweets": 76,
+      "filtered_tweets": 61,
+      "deduplicated_tweets": 61,
+      "new_tweets": 12,
+      "summaries": 61,
       "alerts_sent": 3
     },
-    "summaries": [
+    "tweets": [
       {
+        "tweet_id": "3f8b1c2a4d6e",
         "author": "CNBCTV18News",
-        "stock_tags": ["RELIANCE"],
-        "summary": "Reliance announces ₹5,000 crore green energy capex.",
-        "timestamp": "2026-05-03T09:10:00+00:00",
-        "tweet_id": "1234567890"
+        "raw_text": "L&T wins ₹2,500–5,000 Cr order...",
+        "clean_text": "L&T wins 2500 5000 Cr order...",
+        "summary": "Larsen & Toubro wins ₹2,500–5,000 Cr infra order from NTPC.",
+        "created_at": "2026-05-04T09:10:00+00:00",
+        "stock_tags": ["LT", "BHARATCOAL"],
+        "source": "playwright+nitter:nitter.tiekoetter.com"
+      }
+    ],
+    "fetch_debug": [
+      {
+        "account": "CNBCTV18News",
+        "status": "SUCCESS",
+        "tweets_fetched": 20,
+        "error": "",
+        "source": "playwright+nitter"
       }
     ],
     "telegram_errors": []
@@ -243,32 +256,11 @@ One entry per Twitter pipeline run. Newest first, capped at 500 runs. Written by
 ]
 ```
 
-### `data/combined_runs.json`
-One entry per combined `run.py` cycle. Newest first, capped at 500 runs. Written by `run.py` after every cycle regardless of outcome.
-```json
-[
-  {
-    "run_id": "a3f8b1c2",
-    "timestamp": "2026-05-03T09:15:42",
-    "nse": {
-      "status": "SUCCESS",
-      "symbol": "RELIANCE",
-      "signal": "BUY",
-      "telegram_sent": true,
-      "error": ""
-    },
-    "twitter": {
-      "status": "SUCCESS",
-      "summaries_count": 12,
-      "alerts_sent": 3,
-      "error": ""
-    }
-  }
-]
-```
+### `data/seen_tweet_ids.json`
+Flat list of tweet IDs (MD5 hashes) already sent to Telegram. Capped at 5,000 entries. Prevents the same tweet being re-sent across multiple runs.
 
-### `data/twscrape.db`
-SQLite session store created by `twscrape` on first run. Persists authenticated Twitter sessions so re-login is not needed on subsequent runs.
+### `data/combined_runs.json`
+One entry per combined `run.py` cycle. Newest first, capped at 500 runs.
 
 ---
 
@@ -304,12 +296,11 @@ PDF_SUMMARY_FINAL_NUM_PREDICT=700
 PDF_SUMMARY_BATCH_SIZE=6
 
 # ── Twitter pipeline ──────────────────────────────────────────────────────────
-# One or more Twitter/X accounts for twscrape to authenticate with.
-# Format: username,password,email,email_password
-# Multiple accounts separated by semicolons:
-TWITTER_ACCOUNTS=user1,pass1,email1,epass1;user2,pass2,email2,epass2
-TWEETS_PER_ACCOUNT=50
+# Number of tweets to fetch per account per run (default 20)
+TWEETS_PER_ACCOUNT=20
 ```
+
+> No Twitter/X account or API key is required. Playwright scrapes via public Nitter instances.
 
 ---
 
@@ -346,19 +337,19 @@ ai_research_agent/
 │   ├── telegram_node.py             # Send Telegram alert when notify=true
 │   │
 │   │  Twitter nodes
-│   ├── tweet_collector_node.py      # Fetch tweets via twscrape
+│   ├── tweet_collector_node.py      # Fetch tweets via Playwright+Nitter
 │   ├── noise_filter_node.py         # Clean text; keep only financial keywords
-│   ├── dedup_node.py                # TF-IDF cosine deduplication
+│   ├── dedup_node.py                # TF-IDF cosine deduplication (within-run)
 │   ├── stock_detector_node.py       # Tag tweets with NSE symbols
 │   ├── tweet_summarizer_node.py     # Batch Groq summarisation (10 tweets/call)
-│   └── twitter_telegram_node.py     # Send digests; write twitter_output.json
+│   └── twitter_telegram_node.py     # Filter seen IDs; send digests; write output
 │
 ├── services/
 │   ├── llm_service.py               # Groq API — primary + 2 backup models
 │   ├── telegram_service.py          # Telegram Bot API
 │   ├── pdf_service.py               # PDF download + page-by-page extraction
 │   ├── tavily_service.py            # Tavily web search
-│   ├── twitter_scraper_service.py   # twscrape async wrapper
+│   ├── twitter_scraper_service.py   # Playwright+Nitter scraper (no login needed)
 │   ├── stock_detector_service.py    # NSE symbol lookup + 50+ company aliases
 │   └── dedup_service.py             # Pure-Python TF-IDF cosine similarity
 │
@@ -371,9 +362,10 @@ ai_research_agent/
     ├── seen_ids.json                # Processed NSE record IDs
     ├── pdf_summaries.json           # SHA-256 keyed PDF summary cache
     ├── ai_research_output.json      # NSE signal results (full state per stock)
-    ├── twitter_output.json          # Twitter summaries per run (capped 500)
+    ├── twitter_output.json          # Twitter run log with full tweet records
+    ├── seen_tweet_ids.json          # Tweet IDs already sent to Telegram
     ├── combined_runs.json           # Combined cycle log (capped 500)
-    └── twscrape.db                  # Twitter session store (SQLite)
+    └── twscrape.db                  # (legacy — no longer used)
 ```
 
 ---
@@ -387,7 +379,12 @@ requests
 python-dotenv
 pymupdf
 pandas
-twscrape
+beautifulsoup4
+playwright
 ```
 
-Install: `pip install -r requirements.txt`
+Install:
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```

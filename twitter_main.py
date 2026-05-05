@@ -21,6 +21,7 @@ def _initial_state() -> dict:
         "filtered_tweets": [],
         "deduplicated_tweets": [],
         "summaries": [],
+        "fetch_debug": [],
         "alerts_sent": 0,
         "telegram_errors": [],
         "status": "PENDING",
